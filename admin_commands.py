@@ -1,13 +1,15 @@
 """
 Admin-only commands router.
-Provides /orders, /order, /find, /filter, /export commands.
+Provides /orders, /order, /find, /filter, /export, /health commands.
 """
 import io
+import os
+import time
 from aiogram import Router, Bot
 from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import Command, CommandObject
 
-from config import ADMINS
+from config import ADMINS, get_startup_info
 from admin_keyboards import get_order_status_keyboard, STATUS_DISPLAY
 import db
 from i18n import t
@@ -296,3 +298,104 @@ async def cmd_export(message: Message, command: CommandObject):
         
     except Exception as e:
         await message.answer(f"❌ Eksport xatosi: {e}")
+
+
+# ============== /health COMMAND ==============
+
+@admin_router.message(Command("health"))
+async def cmd_health(message: Message):
+    """
+    Health check command for monitoring.
+    Shows bot uptime, version, database status, and FSM storage type.
+    """
+    if not is_admin(message.from_user.id):
+        return  # Silently ignore for non-admins
+    
+    # Calculate uptime (BOT_START_TIME is set in main.py)
+    try:
+        from main import BOT_START_TIME
+        uptime_secs = int(time.time() - BOT_START_TIME)
+        hours, remainder = divmod(uptime_secs, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+    except ImportError:
+        uptime_str = "unknown"
+    
+    # Database health check
+    try:
+        order_count = db.get_orders_count()
+        user_count_result = db.get_connection().execute("SELECT COUNT(*) FROM users").fetchone()
+        user_count = user_count_result[0] if user_count_result else 0
+        db_status = f"✅ OK ({order_count} orders, {user_count} users)"
+    except Exception as e:
+        db_status = f"❌ Error: {e}"
+    
+    # Version info
+    version_info = get_startup_info()
+    
+    # FSM storage type
+    fsm_storage = "Redis" if os.getenv("REDIS_URL") else "Memory (⚠️ state lost on restart)"
+    
+    report = (
+        f"🏥 <b>Health Check</b>\n\n"
+        f"<b>Status:</b> ✅ Running\n"
+        f"<b>Uptime:</b> {uptime_str}\n"
+        f"<b>Version:</b> {version_info}\n"
+        f"<b>Database:</b> {db_status}\n"
+        f"<b>FSM Storage:</b> {fsm_storage}\n"
+        f"<b>Admins:</b> {len(ADMINS)}"
+    )
+    
+    await message.answer(report, parse_mode="HTML")
+
+
+# ============== /partners COMMAND ==============
+
+@admin_router.message(Command("partners"))
+async def cmd_partners(message: Message):
+    """
+    List all partners for admin (grouped by type).
+    Shows connection status and connect_code.
+    """
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        import db_postgres as db_pg
+        partners = await db_pg.get_all_partners()
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: {e}")
+        return
+    
+    if not partners:
+        await message.answer("📭 Partnerlar topilmadi.")
+        return
+    
+    # Group by type
+    by_type: dict[str, list] = {}
+    for p in partners:
+        ptype = p["type"]
+        if ptype not in by_type:
+            by_type[ptype] = []
+        by_type[ptype].append(p)
+    
+    type_emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}
+    
+    lines = ["<b>📋 Partnerlar ro'yxati</b>\n"]
+    
+    for ptype, plist in by_type.items():
+        emoji = type_emoji.get(ptype, "📦")
+        lines.append(f"\n{emoji} <b>{ptype.upper()}</b> ({len(plist)} ta)")
+        
+        for p in plist:
+            status = "✅" if p["telegram_id"] else "⏳"
+            active = "🟢" if p["is_active"] else "🔴"
+            lines.append(
+                f"  {status}{active} {p['display_name']}\n"
+                f"      Kod: <code>{p['connect_code']}</code>\n"
+                f"      ID: <code>{p['id'][:8]}...</code>"
+            )
+    
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+

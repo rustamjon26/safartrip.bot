@@ -1,0 +1,33 @@
+# Exclude secrets and sensitive files
+.env
+.env.*
+!.env.example
+
+# Session files (Pyrogram/Telethon)
+*.session
+*.session-journal
+
+# Database files
+*.db
+*.sqlite3
+*.sqlite
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Git
+.git/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

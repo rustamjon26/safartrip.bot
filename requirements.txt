@@ -1,3 +1,13 @@
+# Core dependencies
 aiogram==3.4.1
-python-dotenv==1.0.0
-python-dotenv
+python-dotenv==1.0.1
+
+# HTTP client with timeouts (for external API calls)
+aiohttp>=3.9.0
+
+# PostgreSQL async driver (required for partner booking system)
+asyncpg>=0.29.0
+
+# Optional: Redis for FSM persistence (recommended for production)
+# Uncomment if using REDIS_URL:
+# redis>=5.0.0

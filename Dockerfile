@@ -2,12 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Install dependencies first (better layer caching)
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt
 
+# Copy source code
 COPY . .
 
-CMD ["python", "main.py"],
+# Security: Remove any accidentally copied sensitive files
+RUN rm -f .env *.session *.session-journal *.db
 
-CMD ["bash", "-lc", "echo BOT_TOKEN_LEN=${#BOT_TOKEN}; echo ADMINS=$ADMINS; env | grep -E '^(BOT_TOKEN|ADMINS|API_ID|API_HASH)=' || true; python main.py"]
+# Run bot
+CMD ["python", "main.py"]
