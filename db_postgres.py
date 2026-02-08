@@ -482,6 +482,55 @@ async def seed_partners(sample_guides: list[dict], sample_taxis: list[dict], sam
         return 0
 
 
+async def seed_partners_default() -> dict:
+    """
+    Seed default sample partners (4 guides, 5 taxis, 2 hotels).
+    Returns dict with inserted count and total.
+    """
+    sample_guides = [
+        {"display_name": "Akmal - Samarqand gidi", "connect_code": "GUIDE-001"},
+        {"display_name": "Dilshod - Buxoro gidi", "connect_code": "GUIDE-002"},
+        {"display_name": "Malika - Xiva gidi", "connect_code": "GUIDE-003"},
+        {"display_name": "Jasur - Toshkent gidi", "connect_code": "GUIDE-004"},
+    ]
+    
+    sample_taxis = [
+        {"display_name": "Tez Taksi - Toshkent", "connect_code": "TAXI-001"},
+        {"display_name": "Samarqand Express", "connect_code": "TAXI-002"},
+        {"display_name": "Buxoro Taksi", "connect_code": "TAXI-003"},
+        {"display_name": "Xiva Transport", "connect_code": "TAXI-004"},
+        {"display_name": "Farg'ona Taksi", "connect_code": "TAXI-005"},
+    ]
+    
+    sample_hotels = [
+        {
+            "display_name": "Hotel Ichan Qala - Xiva",
+            "connect_code": "HOTEL-001",
+            "latitude": 41.378889,
+            "longitude": 60.363889,
+            "address": "Xiva, Ichan Qala, Pahlavon Mahmud ko'chasi",
+        },
+        {
+            "display_name": "Samarqand Registan Plaza",
+            "connect_code": "HOTEL-002",
+            "latitude": 39.654167,
+            "longitude": 66.959722,
+            "address": "Samarqand, Registon maydoni yaqinida",
+        },
+    ]
+    
+    count = await seed_partners(sample_guides, sample_taxis, sample_hotels)
+    
+    # Get total count
+    partners = await get_all_partners()
+    
+    return {
+        "inserted": count,
+        "updated": 0,
+        "total": len(partners),
+    }
+
+
 # ---------------------------------------------------------------------
 # Booking functions
 # ---------------------------------------------------------------------

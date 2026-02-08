@@ -1,568 +1,394 @@
 """
-Admin-only commands router.
-Provides /orders, /order, /find, /filter, /export, /health commands.
+Admin commands router for Telegram bot.
+
+Commands:
+- /admin_help - Show admin commands list
+- /admin_health - Database health check and partner stats
+- /seed_partners - Seed sample partners
+- /partners - List all partners
+- /connect CODE - Partner connection (non-admin)
+
+All messages use parse_mode=None to avoid HTML/Markdown parse errors.
 """
-import io
-import os
-import time
+import logging
 from aiogram import Router, Bot
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
 
-from config import ADMINS, get_startup_info
-from admin_keyboards import get_order_status_keyboard, STATUS_DISPLAY
-import db
-from i18n import t
-from export_utils import generate_orders_csv
+from config import ADMINS
+import db_postgres as db_pg
 
-# Create router for admin commands
-admin_router = Router()
+logger = logging.getLogger(__name__)
 
+# Create router
+router = Router(name="admin_commands")
+
+# Telegram message size limit (safe margin)
+MAX_MESSAGE_LENGTH = 4000
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
 
 def is_admin(user_id: int) -> bool:
     """Check if user is an admin."""
     return user_id in ADMINS
 
 
-def format_order_short(order: dict) -> str:
-    """Format order as short summary for list view."""
-    return (
-        f"📦 <b>#{order['id']}</b> | {STATUS_DISPLAY.get(order['status'], order['status'])}\n"
-        f"   {order['service']}\n"
-        f"   👤 {order['name']} | 📱 {order['phone']}\n"
-        f"   📅 {order['date_text']}\n"
-        f"   🕐 {order['created_at']}"
-    )
-
-
-def format_order_full(order: dict) -> str:
-    """Format order with full details."""
-    return (
-        f"📦 <b>Buyurtma #{order['id']}</b>\n\n"
-        f"🏷 <b>Xizmat:</b> {order['service']}\n"
-        f"👤 <b>Mijoz:</b> {order['name']}\n"
-        f"📱 <b>Telefon:</b> {order['phone']}\n"
-        f"📅 <b>Sana/vaqt:</b> {order['date_text']}\n"
-        f"📝 <b>Qo'shimcha:</b> {order['details']}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 User ID: {order['user_id']}\n"
-        f"👤 Username: @{order['username'] or 'N/A'}\n"
-        f"📊 Status: {STATUS_DISPLAY.get(order['status'], order['status'])}\n"
-        f"🕐 Yaratilgan: {order['created_at']}\n"
-        f"🔄 Yangilangan: {order['updated_at']}"
-    )
-
-
-# ============== /orders COMMAND ==============
-
-@admin_router.message(Command("orders"))
-async def cmd_orders(message: Message, command: CommandObject):
-    """
-    Show orders list.
-    Usage: /orders [status] [page]
-    """
-    if not is_admin(message.from_user.id):
-        lang = db.get_user_lang(message.from_user.id)
-        await message.answer(t("no_access", lang))
-        return
+def chunk_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split long text into chunks that fit Telegram message limits."""
+    if len(text) <= max_length:
+        return [text]
     
-    args = command.args.split() if command.args else []
+    chunks = []
+    lines = text.split("\n")
+    current_chunk = ""
     
-    # Parse arguments
-    status = None
-    page = 1
-    
-    valid_statuses = ("new", "accepted", "contacted", "done")
-    
-    for arg in args:
-        if arg.lower() in valid_statuses:
-            status = arg.lower()
-        elif arg.isdigit():
-            page = max(1, int(arg))
-    
-    # Calculate offset
-    limit = 10
-    offset = (page - 1) * limit
-    
-    # Get orders
-    orders = db.get_orders(status=status, limit=limit, offset=offset)
-    total = db.get_orders_count(status=status)
-    
-    if not orders:
-        status_text = f" ({status})" if status else ""
-        await message.answer(f"📭 Buyurtmalar topilmadi{status_text}.")
-        return
-    
-    # Format response
-    total_pages = (total + limit - 1) // limit
-    status_text = f" [{status.upper()}]" if status else ""
-    
-    header = f"📋 <b>Buyurtmalar{status_text}</b> (sahifa {page}/{total_pages}, jami: {total})\n\n"
-    
-    order_texts = [format_order_short(order) for order in orders]
-    
-    footer = f"\n\n💡 <i>/order &lt;id&gt; - to'liq ma'lumot</i>"
-    if total_pages > 1:
-        status_arg = status if status else ""
-        footer += f"\n<i>/orders {status_arg} {page+1} - keyingi sahifa</i>"
-    
-    await message.answer(
-        header + "\n\n".join(order_texts) + footer,
-        parse_mode="HTML",
-    )
-
-
-# ============== /order <id> COMMAND ==============
-
-@admin_router.message(Command("order"))
-async def cmd_order_detail(message: Message, command: CommandObject):
-    """
-    Show single order details with status buttons.
-    Usage: /order <id>
-    """
-    if not is_admin(message.from_user.id):
-        lang = db.get_user_lang(message.from_user.id)
-        await message.answer(t("no_access", lang))
-        return
-    
-    if not command.args or not command.args.strip().isdigit():
-        await message.answer(
-            "❓ <b>Foydalanish:</b> /order &lt;id&gt;\n"
-            "Misol: /order 123",
-            parse_mode="HTML",
-        )
-        return
-    
-    order_id = int(command.args.strip())
-    order = db.get_order_by_id(order_id)
-    
-    if not order:
-        await message.answer(f"❌ Buyurtma #{order_id} topilmadi.")
-        return
-    
-    await message.answer(
-        format_order_full(order),
-        parse_mode="HTML",
-        reply_markup=get_order_status_keyboard(order_id),
-    )
-
-
-# ============== /find COMMAND ==============
-
-@admin_router.message(Command("find"))
-async def cmd_find(message: Message, command: CommandObject):
-    """
-    Search orders by query.
-    Usage: /find <query>
-    """
-    if not is_admin(message.from_user.id):
-        lang = db.get_user_lang(message.from_user.id)
-        await message.answer(t("no_access", lang))
-        return
-    
-    if not command.args or len(command.args.strip()) < 2:
-        await message.answer(
-            "🔍 <b>Qidiruv:</b> /find &lt;so'rov&gt;\n"
-            "Misol: /find Ali\n\n"
-            "Qidiruv: ism, telefon, xizmat, izoh, username bo'yicha.",
-            parse_mode="HTML",
-        )
-        return
-    
-    query = command.args.strip()
-    orders = db.search_orders(query, limit=10)
-    
-    if not orders:
-        await message.answer(f"🔍 \"{query}\" bo'yicha hech narsa topilmadi.")
-        return
-    
-    header = f"🔍 <b>Qidiruv natijalari:</b> \"{query}\" ({len(orders)} ta)\n\n"
-    order_texts = [format_order_short(order) for order in orders]
-    
-    await message.answer(
-        header + "\n\n".join(order_texts),
-        parse_mode="HTML",
-    )
-
-
-# ============== /filter COMMAND ==============
-
-@admin_router.message(Command("filter"))
-async def cmd_filter(message: Message, command: CommandObject):
-    """
-    Filter orders by service or date.
-    Usage: /filter service <value>
-           /filter date <value>
-    """
-    if not is_admin(message.from_user.id):
-        lang = db.get_user_lang(message.from_user.id)
-        await message.answer(t("no_access", lang))
-        return
-    
-    if not command.args:
-        await message.answer(
-            "🏷 <b>Filtrlash:</b>\n\n"
-            "/filter service &lt;qiymat&gt;\n"
-            "Misol: /filter service mehmonxona\n\n"
-            "/filter date &lt;qiymat&gt;\n"
-            "Misol: /filter date 2025-01",
-            parse_mode="HTML",
-        )
-        return
-    
-    parts = command.args.split(maxsplit=1)
-    
-    if len(parts) < 2:
-        await message.answer("❓ Qiymat kiriting. Misol: /filter service mehmonxona")
-        return
-    
-    filter_type = parts[0].lower()
-    value = parts[1].strip()
-    
-    if len(value) < 2:
-        await message.answer("❓ Qiymat juda qisqa. Kamida 2 ta belgi kiriting.")
-        return
-    
-    if filter_type == "service":
-        orders = db.filter_orders_by_service(value, limit=10)
-        filter_label = f"xizmat: \"{value}\""
-    elif filter_type == "date":
-        orders = db.filter_orders_by_date(value, limit=10)
-        filter_label = f"sana: \"{value}\""
-    else:
-        await message.answer("❓ Noto'g'ri filtr turi. Foydalaning: service yoki date")
-        return
-    
-    if not orders:
-        await message.answer(f"🏷 {filter_label} bo'yicha hech narsa topilmadi.")
-        return
-    
-    header = f"🏷 <b>Filtr:</b> {filter_label} ({len(orders)} ta)\n\n"
-    order_texts = [format_order_short(order) for order in orders]
-    
-    await message.answer(
-        header + "\n\n".join(order_texts),
-        parse_mode="HTML",
-    )
-
-
-# ============== /export COMMAND ==============
-
-@admin_router.message(Command("export"))
-async def cmd_export(message: Message, command: CommandObject):
-    """
-    Export orders to CSV file.
-    Usage: /export [status]
-    """
-    if not is_admin(message.from_user.id):
-        lang = db.get_user_lang(message.from_user.id)
-        await message.answer(t("no_access", lang))
-        return
-    
-    # Parse optional status argument
-    status = None
-    valid_statuses = ("new", "accepted", "contacted", "done")
-    
-    if command.args:
-        arg = command.args.strip().lower()
-        if arg in valid_statuses:
-            status = arg
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > max_length:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = line + "\n"
         else:
-            await message.answer(
-                "📊 <b>Eksport:</b> /export [status]\n\n"
-                "Statuslar: new, accepted, contacted, done\n"
-                "Misol: /export new\n"
-                "Hammasi: /export",
-                parse_mode="HTML",
-            )
-            return
+            current_chunk += line + "\n"
     
-    # Generate CSV
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks if chunks else [text[:max_length]]
+
+
+def safe_get(d: dict, key: str, default=""):
+    """Safely get value from dict."""
     try:
-        filename, csv_bytes = generate_orders_csv(status)
-        
-        # Check if there's data
-        if len(csv_bytes) < 100:  # Just header, no data
-            status_text = f" ({status})" if status else ""
-            await message.answer(f"📭 Eksport qilish uchun buyurtmalar yo'q{status_text}.")
-            return
-        
-        # Send as document
-        document = BufferedInputFile(csv_bytes, filename=filename)
-        
-        status_text = f" [{status.upper()}]" if status else " [BARCHASI]"
-        await message.answer_document(
-            document=document,
-            caption=f"📊 Buyurtmalar eksporti{status_text}",
-        )
-        
-    except Exception as e:
-        await message.answer(f"❌ Eksport xatosi: {e}")
+        val = d.get(key, default)
+        return val if val is not None else default
+    except Exception:
+        return default
 
 
-# ============== /health COMMAND ==============
+# =============================================================================
+# /admin_help
+# =============================================================================
 
-@admin_router.message(Command("health"))
-async def cmd_health(message: Message):
-    """
-    Health check command for monitoring.
-    Shows bot uptime, version, database status, and FSM storage type.
-    """
-    if not is_admin(message.from_user.id):
-        return  # Silently ignore for non-admins
-    
-    # Calculate uptime (BOT_START_TIME is set in main.py)
-    try:
-        from main import BOT_START_TIME
-        uptime_secs = int(time.time() - BOT_START_TIME)
-        hours, remainder = divmod(uptime_secs, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        uptime_str = f"{hours}h {minutes}m {seconds}s"
-    except ImportError:
-        uptime_str = "unknown"
-    
-    # Database health check
-    try:
-        order_count = db.get_orders_count()
-        user_count_result = db.get_connection().execute("SELECT COUNT(*) FROM users").fetchone()
-        user_count = user_count_result[0] if user_count_result else 0
-        db_status = f"✅ OK ({order_count} orders, {user_count} users)"
-    except Exception as e:
-        db_status = f"❌ Error: {e}"
-    
-    # Version info
-    version_info = get_startup_info()
-    
-    # FSM storage type
-    fsm_storage = "Redis" if os.getenv("REDIS_URL") else "Memory (⚠️ state lost on restart)"
-    
-    report = (
-        f"🏥 <b>Health Check</b>\n\n"
-        f"<b>Status:</b> ✅ Running\n"
-        f"<b>Uptime:</b> {uptime_str}\n"
-        f"<b>Version:</b> {version_info}\n"
-        f"<b>Database:</b> {db_status}\n"
-        f"<b>FSM Storage:</b> {fsm_storage}\n"
-        f"<b>Admins:</b> {len(ADMINS)}"
-    )
-    
-    await message.answer(report, parse_mode="HTML")
-
-
-# ============== /partners COMMAND ==============
-
-@admin_router.message(Command("partners"))
-async def cmd_partners(message: Message):
-    """
-    List all partners for admin (grouped by type).
-    Shows connection status and connect_code.
-    """
+@router.message(Command("admin_help"))
+async def cmd_admin_help(message: Message):
+    """Show admin commands list."""
     if not is_admin(message.from_user.id):
         return
     
-    try:
-        import db_postgres as db_pg
-        partners = await db_pg.get_all_partners()
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
-        return
+    text = """ADMIN COMMANDS
+
+/admin_help - Show this help
+/admin_health - Database health check and partner stats
+/seed_partners - Seed sample partners (4 guides, 5 taxis, 2 hotels)
+/partners - List all partners with details
+
+NON-ADMIN COMMANDS
+/connect CODE - Partner connects their Telegram account"""
     
-    if not partners:
-        await message.answer("📭 Partnerlar topilmadi.")
-        return
-    
-    # Group by type
-    by_type: dict[str, list] = {}
-    for p in partners:
-        ptype = p["type"]
-        if ptype not in by_type:
-            by_type[ptype] = []
-        by_type[ptype].append(p)
-    
-    type_emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}
-    
-    lines = ["<b>📋 Partnerlar ro'yxati</b>\n"]
-    
-    for ptype, plist in by_type.items():
-        emoji = type_emoji.get(ptype, "📦")
-        lines.append(f"\n{emoji} <b>{ptype.upper()}</b> ({len(plist)} ta)")
-        
-        for p in plist:
-            status = "✅" if p["telegram_id"] else "⏳"
-            active = "🟢" if p["is_active"] else "🔴"
-            lines.append(
-                f"  {status}{active} {p['display_name']}\n"
-                f"      Kod: <code>{p['connect_code']}</code>\n"
-                f"      ID: <code>{p['id'][:8]}...</code>"
-            )
-    
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer(text, parse_mode=None)
 
 
-# ============== /admin_health COMMAND ==============
+# =============================================================================
+# /admin_health
+# =============================================================================
 
-@admin_router.message(Command("admin_health"))
+@router.message(Command("admin_health"))
 async def cmd_admin_health(message: Message):
-    """
-    Comprehensive health check for admins.
-    Shows DB connectivity, partner counts by type, and top partners.
-    """
+    """Database health check and partner statistics."""
     if not is_admin(message.from_user.id):
         return
     
-    import db_postgres as db_pg
-    
-    lines = ["🏥 ADMIN HEALTH CHECK\n"]
+    lines = ["🏥 ADMIN HEALTH CHECK", ""]
     
     # PostgreSQL connectivity
-    pg_ok, pg_msg = await db_pg.healthcheck()
-    lines.append(f"PostgreSQL: {'✅' if pg_ok else '❌'} {pg_msg}")
+    try:
+        pg_ok, pg_msg = await db_pg.healthcheck()
+        status = "✅" if pg_ok else "❌"
+        lines.append(f"PostgreSQL: {status} {pg_msg}")
+    except Exception as e:
+        lines.append(f"PostgreSQL: ❌ Error: {e}")
+        await message.answer("\n".join(lines), parse_mode=None)
+        return
     
     if not pg_ok:
-        lines.append("\n⚠️ Database connection failed!")
+        lines.append("")
+        lines.append("⚠️ Database connection failed!")
         lines.append("Check DATABASE_URL and ensure PostgreSQL is running.")
         await message.answer("\n".join(lines), parse_mode=None)
         return
     
     # Get all partners
-    all_partners = await db_pg.get_all_partners()
+    try:
+        all_partners = await db_pg.get_all_partners()
+    except Exception as e:
+        lines.append(f"Error fetching partners: {e}")
+        await message.answer("\n".join(lines), parse_mode=None)
+        return
     
     # Count by type
     by_type: dict[str, list] = {"guide": [], "taxi": [], "hotel": []}
     for p in all_partners:
-        ptype = p.get("type", "unknown")
+        ptype = safe_get(p, "type", "unknown").lower()
         if ptype in by_type:
             by_type[ptype].append(p)
     
-    lines.append(f"\n📊 PARTNERS SUMMARY:")
+    lines.append("")
+    lines.append("📊 PARTNERS SUMMARY")
     lines.append(f"  Total: {len(all_partners)}")
     
+    type_emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}
+    
     for ptype, plist in by_type.items():
-        active = len([p for p in plist if p.get("is_active")])
-        connected = len([p for p in plist if p.get("telegram_id")])
-        emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}.get(ptype, "📦")
+        active = len([p for p in plist if safe_get(p, "is_active", False)])
+        connected = len([p for p in plist if safe_get(p, "telegram_id")])
+        emoji = type_emoji.get(ptype, "📦")
         lines.append(f"  {emoji} {ptype}: {len(plist)} total, {active} active, {connected} connected")
     
     # Top 3 per type
     for ptype, plist in by_type.items():
         if not plist:
             continue
-        emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}.get(ptype, "📦")
-        lines.append(f"\n{emoji} {ptype.upper()} (top 3):")
+        emoji = type_emoji.get(ptype, "📦")
+        lines.append("")
+        lines.append(f"{emoji} {ptype.upper()} (top 3):")
+        
         for p in plist[:3]:
-            status = "✅" if p.get("telegram_id") else "❌"
-            active = "🟢" if p.get("is_active") else "🔴"
-            lines.append(f"  {status}{active} {p['display_name']}")
-            lines.append(f"      ID: {p['id'][:8]} | Code: {p['connect_code']}")
+            tid = safe_get(p, "telegram_id")
+            is_active = safe_get(p, "is_active", False)
+            
+            connected_icon = "✅" if tid else "❌"
+            active_icon = "🟢" if is_active else "🔴"
+            name = safe_get(p, "display_name", "Unknown")
+            pid = safe_get(p, "id", "????????")[:8]
+            code = safe_get(p, "connect_code", "N/A")
+            
+            lines.append(f"  {connected_icon}{active_icon} {name}")
+            lines.append(f"      ID: {pid} | Code: {code}")
     
     # Warnings
     if len(all_partners) == 0:
-        lines.append("\n⚠️ No partners found!")
+        lines.append("")
+        lines.append("⚠️ No partners found!")
         lines.append("Run /seed_partners to create sample partners.")
     
-    total_active = len([p for p in all_partners if p.get("is_active")])
+    total_active = len([p for p in all_partners if safe_get(p, "is_active", False)])
     if total_active == 0 and len(all_partners) > 0:
-        lines.append("\n⚠️ All partners are inactive!")
+        lines.append("")
+        lines.append("⚠️ All partners are inactive!")
         lines.append("Check is_active column in database.")
     
     await message.answer("\n".join(lines), parse_mode=None)
 
 
-# ============== /seed_partners COMMAND ==============
+# =============================================================================
+# /seed_partners
+# =============================================================================
 
-@admin_router.message(Command("seed_partners"))
+@router.message(Command("seed_partners"))
 async def cmd_seed_partners(message: Message):
-    """
-    Seed sample partners (4 guides, 5 taxis, 2 hotels).
-    Uses upsert by connect_code, safe to run multiple times.
-    """
+    """Seed sample partners into database."""
     if not is_admin(message.from_user.id):
         return
     
-    import db_postgres as db_pg
-    
-    await message.answer("🔄 Seeding partners...")
-    
-    # Sample guides
-    sample_guides = [
-        {"display_name": "Akmal - Samarqand gidi", "connect_code": "GUIDE-001"},
-        {"display_name": "Dilshod - Buxoro gidi", "connect_code": "GUIDE-002"},
-        {"display_name": "Malika - Xiva gidi", "connect_code": "GUIDE-003"},
-        {"display_name": "Jasur - Toshkent gidi", "connect_code": "GUIDE-004"},
-    ]
-    
-    # Sample taxis
-    sample_taxis = [
-        {"display_name": "Tez Taksi - Toshkent", "connect_code": "TAXI-001"},
-        {"display_name": "Samarqand Express", "connect_code": "TAXI-002"},
-        {"display_name": "Buxoro Taksi", "connect_code": "TAXI-003"},
-        {"display_name": "Xiva Transport", "connect_code": "TAXI-004"},
-        {"display_name": "Farg'ona Taksi", "connect_code": "TAXI-005"},
-    ]
-    
-    # Sample hotels with location
-    sample_hotels = [
-        {
-            "display_name": "Hotel Ichan Qala - Xiva",
-            "connect_code": "HOTEL-001",
-            "latitude": 41.378889,
-            "longitude": 60.363889,
-            "address": "Xiva, Ichan Qala, Pahlavon Mahmud ko'chasi",
-        },
-        {
-            "display_name": "Samarqand Registan Plaza",
-            "connect_code": "HOTEL-002",
-            "latitude": 39.654167,
-            "longitude": 66.959722,
-            "address": "Samarqand, Registon maydoni yaqinida",
-        },
-    ]
+    await message.answer("🔄 Seeding partners...", parse_mode=None)
     
     try:
-        count = await db_pg.seed_partners(sample_guides, sample_taxis, sample_hotels)
+        result = await db_pg.seed_partners_default()
         
-        # Fetch and show results
-        all_partners = await db_pg.get_all_partners()
+        if result and isinstance(result, dict):
+            inserted = result.get("inserted", "?")
+            updated = result.get("updated", "?")
+            total = result.get("total", "?")
+            text = f"✅ Seeding completed!\n\nInserted: {inserted}\nUpdated: {updated}\nTotal: {total}"
+        else:
+            # seed_partners returned None or non-dict
+            text = "✅ Seeding completed!"
         
-        lines = [f"✅ <b>Seeded {count} partners</b>\n"]
+        # List partners after seeding
+        try:
+            all_partners = await db_pg.get_all_partners()
+            if all_partners:
+                text += f"\n\nPartners in database: {len(all_partners)}"
+                
+                by_type: dict[str, list] = {"guide": [], "taxi": [], "hotel": []}
+                for p in all_partners:
+                    ptype = safe_get(p, "type", "unknown").lower()
+                    if ptype in by_type:
+                        by_type[ptype].append(p)
+                
+                type_emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}
+                for ptype, plist in by_type.items():
+                    if plist:
+                        emoji = type_emoji.get(ptype, "📦")
+                        text += f"\n\n{emoji} {ptype.upper()} ({len(plist)}):"
+                        for p in plist:
+                            name = safe_get(p, "display_name", "Unknown")
+                            code = safe_get(p, "connect_code", "N/A")
+                            text += f"\n  • {name}"
+                            text += f"\n    Code: {code}"
+                
+                text += "\n\n💡 Partners can connect via: /connect CODE"
+        except Exception as e:
+            logger.error(f"Error listing partners after seed: {e}")
         
-        by_type: dict[str, list] = {"guide": [], "taxi": [], "hotel": []}
-        for p in all_partners:
-            ptype = p.get("type", "unknown")
-            if ptype in by_type:
-                by_type[ptype].append(p)
-        
-        for ptype, plist in by_type.items():
-            emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}.get(ptype, "📦")
-            lines.append(f"\n{emoji} <b>{ptype.upper()}</b> ({len(plist)} ta)")
-            for p in plist:
-                lines.append(f"  • {p['display_name']}")
-                lines.append(f"    Code: {p['connect_code']}")
-        
-        lines.append("\n\n💡 Partners can connect via: /connect CODE")
-        
-        await message.answer("\n".join(lines), parse_mode=None)
+        await message.answer(text, parse_mode=None)
         
     except Exception as e:
-        await message.answer(f"❌ Seeding failed: {e}")
+        logger.error(f"Error seeding partners: {e}")
+        await message.answer(f"❌ Seeding failed: {e}", parse_mode=None)
 
 
-# ============== /test_hotel_location COMMAND ==============
+# =============================================================================
+# /partners
+# =============================================================================
 
-@admin_router.message(Command("test_hotel_location"))
-async def cmd_test_hotel_location(message: Message, command: CommandObject, bot: Bot):
-    """
-    Test hotel location sending.
-    Usage: /test_hotel_location HOTEL-001 (or partner UUID)
-    """
+@router.message(Command("partners"))
+async def cmd_partners(message: Message):
+    """List all partners with details."""
     if not is_admin(message.from_user.id):
         return
     
-    import db_postgres as db_pg
+    try:
+        all_partners = await db_pg.get_all_partners()
+    except Exception as e:
+        await message.answer(f"❌ Error fetching partners: {e}", parse_mode=None)
+        return
+    
+    if not all_partners:
+        await message.answer("📭 No partners found. Run /seed_partners to create sample partners.", parse_mode=None)
+        return
+    
+    # Group by type
+    by_type: dict[str, list] = {"guide": [], "taxi": [], "hotel": []}
+    for p in all_partners:
+        ptype = safe_get(p, "type", "unknown").lower()
+        if ptype in by_type:
+            by_type[ptype].append(p)
+        else:
+            by_type.setdefault("other", []).append(p)
+    
+    lines = [f"📋 PARTNERS LIST ({len(all_partners)} total)", ""]
+    
+    type_emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨", "other": "📦"}
+    
+    for ptype in ["guide", "taxi", "hotel", "other"]:
+        plist = by_type.get(ptype, [])
+        if not plist:
+            continue
+        
+        # Sort by display_name
+        plist.sort(key=lambda x: safe_get(x, "display_name", "").lower())
+        
+        emoji = type_emoji.get(ptype, "📦")
+        lines.append(f"{emoji} {ptype.upper()} ({len(plist)})")
+        lines.append("-" * 30)
+        
+        for p in plist:
+            tid = safe_get(p, "telegram_id")
+            is_active = safe_get(p, "is_active", False)
+            
+            connected_icon = "✅" if tid else "❌"
+            active_icon = "🟢" if is_active else "🔴"
+            name = safe_get(p, "display_name", "Unknown")
+            pid = safe_get(p, "id", "????????")[:8]
+            code = safe_get(p, "connect_code", "N/A")
+            
+            lines.append(f"{active_icon}{connected_icon} [{ptype}] {name}")
+            lines.append(f"   ID: {pid}...")
+            lines.append(f"   Code: {code}")
+            lines.append(f"   Telegram: {tid or 'Not connected'}")
+            
+            # Location info for hotels
+            lat = safe_get(p, "latitude")
+            lng = safe_get(p, "longitude")
+            addr = safe_get(p, "address")
+            
+            if lat and lng:
+                lines.append(f"   Location: {lat}, {lng}")
+            if addr:
+                lines.append(f"   Address: {addr}")
+            
+            lines.append("")
+    
+    # Chunk and send
+    full_text = "\n".join(lines)
+    chunks = chunk_message(full_text)
+    
+    for i, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            header = f"[{i+1}/{len(chunks)}]\n\n"
+            chunk = header + chunk
+        await message.answer(chunk, parse_mode=None)
+
+
+# =============================================================================
+# /connect CODE
+# =============================================================================
+
+@router.message(Command("connect"))
+async def cmd_connect(message: Message, command: CommandObject):
+    """Partner connects their Telegram account using a connect code."""
+    code = command.args.strip() if command.args else ""
+    
+    if not code:
+        await message.answer(
+            "Usage: /connect YOUR_CODE\n\n"
+            "Example: /connect GUIDE-001\n\n"
+            "The code was provided to you when you registered as a partner.",
+            parse_mode=None
+        )
+        return
+    
+    user_id = message.from_user.id
+    
+    try:
+        result = await db_pg.connect_partner(code, user_id)
+        
+        if result:
+            name = safe_get(result, "display_name", "Partner")
+            ptype = safe_get(result, "type", "unknown")
+            
+            await message.answer(
+                f"✅ Successfully connected!\n\n"
+                f"Name: {name}\n"
+                f"Type: {ptype}\n"
+                f"Telegram ID: {user_id}\n\n"
+                "You will now receive booking requests.",
+                parse_mode=None
+            )
+            logger.info(f"Partner connected: {name} ({ptype}) -> {user_id}")
+        else:
+            await message.answer(
+                "❌ Connection failed.\n\n"
+                "Possible reasons:\n"
+                "• Invalid code\n"
+                "• Partner is inactive\n"
+                "• Code already used by another account\n\n"
+                "Please check your code and try again, or contact support.",
+                parse_mode=None
+            )
+            
+    except Exception as e:
+        logger.error(f"Error connecting partner: {e}")
+        await message.answer(f"❌ Error: {e}", parse_mode=None)
+
+
+# =============================================================================
+# /test_hotel_location (bonus admin command)
+# =============================================================================
+
+@router.message(Command("test_hotel_location"))
+async def cmd_test_hotel_location(message: Message, command: CommandObject, bot: Bot):
+    """Test hotel location sending by code or ID."""
+    if not is_admin(message.from_user.id):
+        return
     
     code = command.args.strip() if command.args else ""
     if not code:
-        await message.answer("Usage: /test_hotel_location HOTEL-001")
+        await message.answer("Usage: /test_hotel_location HOTEL-001", parse_mode=None)
         return
     
     # Try by connect_code first, then by UUID
@@ -571,17 +397,20 @@ async def cmd_test_hotel_location(message: Message, command: CommandObject, bot:
         partner = await db_pg.get_partner_by_id(code)
     
     if not partner:
-        await message.answer(f"Partner not found: {code}")
+        await message.answer(f"Partner not found: {code}", parse_mode=None)
         return
     
-    lat = partner.get("latitude")
-    lng = partner.get("longitude")
-    address = partner.get("address") or ""
+    lat = safe_get(partner, "latitude")
+    lng = safe_get(partner, "longitude")
+    address = safe_get(partner, "address")
+    name = safe_get(partner, "display_name", "Unknown")
+    ptype = safe_get(partner, "type", "unknown")
+    pcode = safe_get(partner, "connect_code", "N/A")
     
-    info = f"Partner: {partner['display_name']}\nType: {partner['type']}\nCode: {partner['connect_code']}"
+    info = f"Partner: {name}\nType: {ptype}\nCode: {pcode}"
     
     if lat and lng:
-        await message.answer(f"📍 Sending location for:\n{info}")
+        await message.answer(f"📍 Sending location for:\n{info}", parse_mode=None)
         try:
             await bot.send_location(
                 chat_id=message.chat.id,
@@ -589,8 +418,14 @@ async def cmd_test_hotel_location(message: Message, command: CommandObject, bot:
                 longitude=float(lng)
             )
             addr_text = f"🏠 Address: {address}" if address else "No address set"
-            await message.answer(addr_text)
+            await message.answer(addr_text, parse_mode=None)
         except Exception as e:
-            await message.answer(f"❌ Failed to send location: {e}")
+            await message.answer(f"❌ Failed to send location: {e}", parse_mode=None)
     else:
-        await message.answer(f"⚠️ No location data for:\n{info}\n\nlatitude: {lat}\nlongitude: {lng}\naddress: {address or 'None'}")
+        await message.answer(
+            f"⚠️ No location data for:\n{info}\n\n"
+            f"latitude: {lat}\n"
+            f"longitude: {lng}\n"
+            f"address: {address or 'None'}",
+            parse_mode=None
+        )
