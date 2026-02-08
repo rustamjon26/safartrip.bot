@@ -412,16 +412,16 @@ async def cmd_admin_health(message: Message):
     
     import db_postgres as db_pg
     
-    lines = ["<b>🏥 Admin Health Check</b>\n"]
+    lines = ["🏥 ADMIN HEALTH CHECK\n"]
     
     # PostgreSQL connectivity
     pg_ok, pg_msg = await db_pg.healthcheck()
-    lines.append(f"<b>PostgreSQL:</b> {'✅' if pg_ok else '❌'} {pg_msg}")
+    lines.append(f"PostgreSQL: {'✅' if pg_ok else '❌'} {pg_msg}")
     
     if not pg_ok:
-        lines.append("\n⚠️ <b>Database connection failed!</b>")
+        lines.append("\n⚠️ Database connection failed!")
         lines.append("Check DATABASE_URL and ensure PostgreSQL is running.")
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("\n".join(lines), parse_mode=None)
         return
     
     # Get all partners
@@ -434,7 +434,7 @@ async def cmd_admin_health(message: Message):
         if ptype in by_type:
             by_type[ptype].append(p)
     
-    lines.append(f"\n<b>📊 Partners Summary:</b>")
+    lines.append(f"\n📊 PARTNERS SUMMARY:")
     lines.append(f"  Total: {len(all_partners)}")
     
     for ptype, plist in by_type.items():
@@ -448,26 +448,24 @@ async def cmd_admin_health(message: Message):
         if not plist:
             continue
         emoji = {"guide": "🧑‍💼", "taxi": "🚕", "hotel": "🏨"}.get(ptype, "📦")
-        lines.append(f"\n{emoji} <b>{ptype.upper()} (top 3):</b>")
+        lines.append(f"\n{emoji} {ptype.upper()} (top 3):")
         for p in plist[:3]:
             status = "✅" if p.get("telegram_id") else "❌"
             active = "🟢" if p.get("is_active") else "🔴"
-            lines.append(
-                f"  {status}{active} {p['display_name']}\n"
-                f"      ID: <code>{p['id'][:8]}</code> | Code: <code>{p['connect_code']}</code>"
-            )
+            lines.append(f"  {status}{active} {p['display_name']}")
+            lines.append(f"      ID: {p['id'][:8]} | Code: {p['connect_code']}")
     
     # Warnings
     if len(all_partners) == 0:
-        lines.append("\n⚠️ <b>No partners found!</b>")
+        lines.append("\n⚠️ No partners found!")
         lines.append("Run /seed_partners to create sample partners.")
     
     total_active = len([p for p in all_partners if p.get("is_active")])
     if total_active == 0 and len(all_partners) > 0:
-        lines.append("\n⚠️ <b>All partners are inactive!</b>")
+        lines.append("\n⚠️ All partners are inactive!")
         lines.append("Check is_active column in database.")
     
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines), parse_mode=None)
 
 
 # ============== /seed_partners COMMAND ==============
@@ -539,14 +537,60 @@ async def cmd_seed_partners(message: Message):
             lines.append(f"\n{emoji} <b>{ptype.upper()}</b> ({len(plist)} ta)")
             for p in plist:
                 lines.append(f"  • {p['display_name']}")
-                lines.append(f"    Code: <code>{p['connect_code']}</code>")
+                lines.append(f"    Code: {p['connect_code']}")
         
-        lines.append("\n\n💡 Partners can connect via: /connect <code>")
+        lines.append("\n\n💡 Partners can connect via: /connect CODE")
         
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("\n".join(lines), parse_mode=None)
         
     except Exception as e:
         await message.answer(f"❌ Seeding failed: {e}")
 
 
+# ============== /test_hotel_location COMMAND ==============
 
+@admin_router.message(Command("test_hotel_location"))
+async def cmd_test_hotel_location(message: Message, command: CommandObject, bot: Bot):
+    """
+    Test hotel location sending.
+    Usage: /test_hotel_location HOTEL-001 (or partner UUID)
+    """
+    if not is_admin(message.from_user.id):
+        return
+    
+    import db_postgres as db_pg
+    
+    code = command.args.strip() if command.args else ""
+    if not code:
+        await message.answer("Usage: /test_hotel_location HOTEL-001")
+        return
+    
+    # Try by connect_code first, then by UUID
+    partner = await db_pg.get_partner_by_code(code)
+    if not partner:
+        partner = await db_pg.get_partner_by_id(code)
+    
+    if not partner:
+        await message.answer(f"Partner not found: {code}")
+        return
+    
+    lat = partner.get("latitude")
+    lng = partner.get("longitude")
+    address = partner.get("address") or ""
+    
+    info = f"Partner: {partner['display_name']}\nType: {partner['type']}\nCode: {partner['connect_code']}"
+    
+    if lat and lng:
+        await message.answer(f"📍 Sending location for:\n{info}")
+        try:
+            await bot.send_location(
+                chat_id=message.chat.id,
+                latitude=float(lat),
+                longitude=float(lng)
+            )
+            addr_text = f"🏠 Address: {address}" if address else "No address set"
+            await message.answer(addr_text)
+        except Exception as e:
+            await message.answer(f"❌ Failed to send location: {e}")
+    else:
+        await message.answer(f"⚠️ No location data for:\n{info}\n\nlatitude: {lat}\nlongitude: {lng}\naddress: {address or 'None'}")

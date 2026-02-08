@@ -267,6 +267,64 @@ async def get_partner_by_id(partner_id: str) -> Optional[dict]:
         return None
 
 
+async def get_partner_location(partner_id: str) -> tuple[float, float, str] | None:
+    """
+    Get partner location (lat, lng, address) by UUID.
+    Returns tuple (latitude, longitude, address) or None if not found or no location.
+    """
+    partner = await get_partner_by_id(partner_id)
+    if not partner:
+        return None
+    
+    lat = partner.get("latitude")
+    lng = partner.get("longitude")
+    address = partner.get("address") or ""
+    
+    if lat is None or lng is None:
+        return None
+    
+    return (float(lat), float(lng), address)
+
+
+async def get_partner_by_code(connect_code: str) -> Optional[dict]:
+    """Get partner by connect_code (for admin testing)."""
+    if not _pool:
+        logger.error("DB pool not initialized")
+        return None
+
+    connect_code = connect_code.strip().upper()
+    if not connect_code:
+        return None
+
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, type, display_name, connect_code, telegram_id, is_active,
+                       latitude, longitude, address
+                FROM partners
+                WHERE UPPER(connect_code) = $1
+                """,
+                connect_code,
+            )
+            if not row:
+                return None
+            return {
+                "id": str(row["id"]),
+                "type": row["type"],
+                "display_name": row["display_name"],
+                "connect_code": row["connect_code"],
+                "telegram_id": row["telegram_id"],
+                "is_active": row["is_active"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "address": row["address"],
+            }
+    except Exception as e:
+        logger.exception(f"Error getting partner by code={connect_code}: {e}")
+        return None
+
+
 async def connect_partner(connect_code: str, telegram_id: int) -> Optional[dict]:
     """
     Partner botga /connect CODE yuboradi.
