@@ -8,4 +8,6 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 
 COPY . .
 
-CMD ["python", "main.py"]
+CMD ["python", "main.py"],
+
+CMD ["bash", "-lc", "echo BOT_TOKEN_LEN=${#BOT_TOKEN}; echo ADMINS=$ADMINS; env | grep -E '^(BOT_TOKEN|ADMINS|API_ID|API_HASH)=' || true; python main.py"]
