@@ -64,12 +64,17 @@ async def start_guide_booking(message: Message, state: FSMContext):
     """Start guide booking - show available guides."""
     await state.clear()
     
+    logger.info("Fetching partners for type='guide'")
     partners = await db_pg.fetch_partners_by_type("guide")
+    logger.info(f"Found {len(partners)} guide partners")
     
     if not partners:
+        logger.warning("No active guides found - check DB seed and is_active status")
         await message.answer(
             "😔 Hozircha faol gidlar yo'q.\n"
-            "Iltimos, keyinroq qaytadan urinib ko'ring.",
+            "Iltimos, keyinroq qaytadan urinib ko'ring.\n\n"
+            "<i>Admin: /seed_partners va /admin_health buyruqlarini tekshiring</i>",
+            parse_mode="HTML",
             reply_markup=get_main_menu()
         )
         return

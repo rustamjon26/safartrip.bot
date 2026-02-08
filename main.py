@@ -105,17 +105,23 @@ async def main():
     else:
         logger.warning(f"SQLite health check failed: {db_msg}")
     
-    # Initialize PostgreSQL database
+    # Initialize PostgreSQL database (REQUIRED for partner features)
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
+        logger.info("Initializing PostgreSQL connection pool...")
         pg_ok = await db_pg.init_db_pool()
         if pg_ok:
             pg_health_ok, pg_health_msg = await healthcheck_postgres()
             logger.info(f"PostgreSQL health check: {pg_health_msg}")
+            print(f"✅ PostgreSQL: {pg_health_msg}")
         else:
-            logger.warning("PostgreSQL pool initialization failed - partner features disabled")
+            logger.error("FATAL: PostgreSQL pool initialization failed!")
+            logger.error("Check DATABASE_URL and network connectivity.")
+            print("❌ PostgreSQL initialization FAILED - exiting")
+            sys.exit(1)
     else:
-        logger.warning("DATABASE_URL not set - partner features disabled")
+        logger.warning("DATABASE_URL not set - partner booking features DISABLED")
+        print("⚠️ DATABASE_URL not set - partner features disabled")
     
     # Ensure backup directory exists
     backup.ensure_backup_dir()
