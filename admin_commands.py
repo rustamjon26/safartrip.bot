@@ -1,0 +1,298 @@
+"""
+Admin-only commands router.
+Provides /orders, /order, /find, /filter, /export commands.
+"""
+import io
+from aiogram import Router, Bot
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command, CommandObject
+
+from config import ADMINS
+from admin_keyboards import get_order_status_keyboard, STATUS_DISPLAY
+import db
+from i18n import t
+from export_utils import generate_orders_csv
+
+# Create router for admin commands
+admin_router = Router()
+
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is an admin."""
+    return user_id in ADMINS
+
+
+def format_order_short(order: dict) -> str:
+    """Format order as short summary for list view."""
+    return (
+        f"📦 <b>#{order['id']}</b> | {STATUS_DISPLAY.get(order['status'], order['status'])}\n"
+        f"   {order['service']}\n"
+        f"   👤 {order['name']} | 📱 {order['phone']}\n"
+        f"   📅 {order['date_text']}\n"
+        f"   🕐 {order['created_at']}"
+    )
+
+
+def format_order_full(order: dict) -> str:
+    """Format order with full details."""
+    return (
+        f"📦 <b>Buyurtma #{order['id']}</b>\n\n"
+        f"🏷 <b>Xizmat:</b> {order['service']}\n"
+        f"👤 <b>Mijoz:</b> {order['name']}\n"
+        f"📱 <b>Telefon:</b> {order['phone']}\n"
+        f"📅 <b>Sana/vaqt:</b> {order['date_text']}\n"
+        f"📝 <b>Qo'shimcha:</b> {order['details']}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 User ID: {order['user_id']}\n"
+        f"👤 Username: @{order['username'] or 'N/A'}\n"
+        f"📊 Status: {STATUS_DISPLAY.get(order['status'], order['status'])}\n"
+        f"🕐 Yaratilgan: {order['created_at']}\n"
+        f"🔄 Yangilangan: {order['updated_at']}"
+    )
+
+
+# ============== /orders COMMAND ==============
+
+@admin_router.message(Command("orders"))
+async def cmd_orders(message: Message, command: CommandObject):
+    """
+    Show orders list.
+    Usage: /orders [status] [page]
+    """
+    if not is_admin(message.from_user.id):
+        lang = db.get_user_lang(message.from_user.id)
+        await message.answer(t("no_access", lang))
+        return
+    
+    args = command.args.split() if command.args else []
+    
+    # Parse arguments
+    status = None
+    page = 1
+    
+    valid_statuses = ("new", "accepted", "contacted", "done")
+    
+    for arg in args:
+        if arg.lower() in valid_statuses:
+            status = arg.lower()
+        elif arg.isdigit():
+            page = max(1, int(arg))
+    
+    # Calculate offset
+    limit = 10
+    offset = (page - 1) * limit
+    
+    # Get orders
+    orders = db.get_orders(status=status, limit=limit, offset=offset)
+    total = db.get_orders_count(status=status)
+    
+    if not orders:
+        status_text = f" ({status})" if status else ""
+        await message.answer(f"📭 Buyurtmalar topilmadi{status_text}.")
+        return
+    
+    # Format response
+    total_pages = (total + limit - 1) // limit
+    status_text = f" [{status.upper()}]" if status else ""
+    
+    header = f"📋 <b>Buyurtmalar{status_text}</b> (sahifa {page}/{total_pages}, jami: {total})\n\n"
+    
+    order_texts = [format_order_short(order) for order in orders]
+    
+    footer = f"\n\n💡 <i>/order &lt;id&gt; - to'liq ma'lumot</i>"
+    if total_pages > 1:
+        status_arg = status if status else ""
+        footer += f"\n<i>/orders {status_arg} {page+1} - keyingi sahifa</i>"
+    
+    await message.answer(
+        header + "\n\n".join(order_texts) + footer,
+        parse_mode="HTML",
+    )
+
+
+# ============== /order <id> COMMAND ==============
+
+@admin_router.message(Command("order"))
+async def cmd_order_detail(message: Message, command: CommandObject):
+    """
+    Show single order details with status buttons.
+    Usage: /order <id>
+    """
+    if not is_admin(message.from_user.id):
+        lang = db.get_user_lang(message.from_user.id)
+        await message.answer(t("no_access", lang))
+        return
+    
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer(
+            "❓ <b>Foydalanish:</b> /order &lt;id&gt;\n"
+            "Misol: /order 123",
+            parse_mode="HTML",
+        )
+        return
+    
+    order_id = int(command.args.strip())
+    order = db.get_order_by_id(order_id)
+    
+    if not order:
+        await message.answer(f"❌ Buyurtma #{order_id} topilmadi.")
+        return
+    
+    await message.answer(
+        format_order_full(order),
+        parse_mode="HTML",
+        reply_markup=get_order_status_keyboard(order_id),
+    )
+
+
+# ============== /find COMMAND ==============
+
+@admin_router.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject):
+    """
+    Search orders by query.
+    Usage: /find <query>
+    """
+    if not is_admin(message.from_user.id):
+        lang = db.get_user_lang(message.from_user.id)
+        await message.answer(t("no_access", lang))
+        return
+    
+    if not command.args or len(command.args.strip()) < 2:
+        await message.answer(
+            "🔍 <b>Qidiruv:</b> /find &lt;so'rov&gt;\n"
+            "Misol: /find Ali\n\n"
+            "Qidiruv: ism, telefon, xizmat, izoh, username bo'yicha.",
+            parse_mode="HTML",
+        )
+        return
+    
+    query = command.args.strip()
+    orders = db.search_orders(query, limit=10)
+    
+    if not orders:
+        await message.answer(f"🔍 \"{query}\" bo'yicha hech narsa topilmadi.")
+        return
+    
+    header = f"🔍 <b>Qidiruv natijalari:</b> \"{query}\" ({len(orders)} ta)\n\n"
+    order_texts = [format_order_short(order) for order in orders]
+    
+    await message.answer(
+        header + "\n\n".join(order_texts),
+        parse_mode="HTML",
+    )
+
+
+# ============== /filter COMMAND ==============
+
+@admin_router.message(Command("filter"))
+async def cmd_filter(message: Message, command: CommandObject):
+    """
+    Filter orders by service or date.
+    Usage: /filter service <value>
+           /filter date <value>
+    """
+    if not is_admin(message.from_user.id):
+        lang = db.get_user_lang(message.from_user.id)
+        await message.answer(t("no_access", lang))
+        return
+    
+    if not command.args:
+        await message.answer(
+            "🏷 <b>Filtrlash:</b>\n\n"
+            "/filter service &lt;qiymat&gt;\n"
+            "Misol: /filter service mehmonxona\n\n"
+            "/filter date &lt;qiymat&gt;\n"
+            "Misol: /filter date 2025-01",
+            parse_mode="HTML",
+        )
+        return
+    
+    parts = command.args.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        await message.answer("❓ Qiymat kiriting. Misol: /filter service mehmonxona")
+        return
+    
+    filter_type = parts[0].lower()
+    value = parts[1].strip()
+    
+    if len(value) < 2:
+        await message.answer("❓ Qiymat juda qisqa. Kamida 2 ta belgi kiriting.")
+        return
+    
+    if filter_type == "service":
+        orders = db.filter_orders_by_service(value, limit=10)
+        filter_label = f"xizmat: \"{value}\""
+    elif filter_type == "date":
+        orders = db.filter_orders_by_date(value, limit=10)
+        filter_label = f"sana: \"{value}\""
+    else:
+        await message.answer("❓ Noto'g'ri filtr turi. Foydalaning: service yoki date")
+        return
+    
+    if not orders:
+        await message.answer(f"🏷 {filter_label} bo'yicha hech narsa topilmadi.")
+        return
+    
+    header = f"🏷 <b>Filtr:</b> {filter_label} ({len(orders)} ta)\n\n"
+    order_texts = [format_order_short(order) for order in orders]
+    
+    await message.answer(
+        header + "\n\n".join(order_texts),
+        parse_mode="HTML",
+    )
+
+
+# ============== /export COMMAND ==============
+
+@admin_router.message(Command("export"))
+async def cmd_export(message: Message, command: CommandObject):
+    """
+    Export orders to CSV file.
+    Usage: /export [status]
+    """
+    if not is_admin(message.from_user.id):
+        lang = db.get_user_lang(message.from_user.id)
+        await message.answer(t("no_access", lang))
+        return
+    
+    # Parse optional status argument
+    status = None
+    valid_statuses = ("new", "accepted", "contacted", "done")
+    
+    if command.args:
+        arg = command.args.strip().lower()
+        if arg in valid_statuses:
+            status = arg
+        else:
+            await message.answer(
+                "📊 <b>Eksport:</b> /export [status]\n\n"
+                "Statuslar: new, accepted, contacted, done\n"
+                "Misol: /export new\n"
+                "Hammasi: /export",
+                parse_mode="HTML",
+            )
+            return
+    
+    # Generate CSV
+    try:
+        filename, csv_bytes = generate_orders_csv(status)
+        
+        # Check if there's data
+        if len(csv_bytes) < 100:  # Just header, no data
+            status_text = f" ({status})" if status else ""
+            await message.answer(f"📭 Eksport qilish uchun buyurtmalar yo'q{status_text}.")
+            return
+        
+        # Send as document
+        document = BufferedInputFile(csv_bytes, filename=filename)
+        
+        status_text = f" [{status.upper()}]" if status else " [BARCHASI]"
+        await message.answer_document(
+            document=document,
+            caption=f"📊 Buyurtmalar eksporti{status_text}",
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ Eksport xatosi: {e}")

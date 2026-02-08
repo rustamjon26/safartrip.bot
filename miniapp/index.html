@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <title>SafarUZ Booking</title>
+
+  <!-- Telegram Mini App SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>🏨 SafarUZ</h1>
+  <p>Dam olish joylarini bron qiling</p>
+</header>
+
+<section id="filters">
+  <select id="typeFilter">
+    <option value="">Barchasi</option>
+    <option value="hotel">Mehmonxona</option>
+    <option value="dacha">Dacha</option>
+    <option value="house">Milliy uy</option>
+  </select>
+
+  <input type="date" id="dateFrom">
+  <input type="date" id="dateTo">
+</section>
+<label>Sana va vaqtni tanlang</label><br><br>
+
+<input type="datetime-local" id="datetime" />
+
+
+<section id="objects">
+  <!-- Cardlar shu yerga tushadi -->
+</section>
+
+<!-- Bron modal -->
+<div id="bookingModal" class="modal hidden">
+  <div class="modal-content">
+    <h3 id="modalTitle"></h3>
+
+    <input type="text" id="clientName" placeholder="Ismingiz">
+    <input type="tel" id="clientPhone" placeholder="Telefon raqam">
+
+    <button id="confirmBooking">✅ Bron qilish</button>
+    <button onclick="closeModal()">❌ Yopish</button>
+  </div>
+</div>
+<script>
+document.getElementById("datetime").addEventListener("change", function () {
+    console.log(this.value);
+});
+</script>
+<script>
+const now = new Date().toISOString().slice(0,16);
+document.getElementById("datetime").min = now;
+</script>
+
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+<input type="text" id="phone" placeholder="Telefon raqam" />
+
+<script>
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+
+    if (tg.initDataUnsafe?.user?.phone_number) {
+        document.getElementById("phone").value =
+            tg.initDataUnsafe.user.phone_number;
+    }
+</script>
+<script src="app.js"></script>
+</body>
+</html>
