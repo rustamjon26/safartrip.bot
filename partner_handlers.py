@@ -85,8 +85,11 @@ async def handle_booking_action(callback: CallbackQuery, bot: Bot):
     action = parts[1]  # "ok" or "no"
     booking_id = parts[2]
     
-    # Get booking
-    booking = await db_pg.get_booking(booking_id)
+    # Get booking - try listing-based first, then legacy
+    booking = await db_pg.get_booking_with_listing(booking_id)
+    if not booking:
+        booking = await db_pg.get_booking(booking_id)
+    
     if not booking:
         await callback.message.edit_text(
             "❌ Buyurtma topilmadi.",
@@ -94,9 +97,14 @@ async def handle_booking_action(callback: CallbackQuery, bot: Bot):
         )
         return
     
-    # Check if already handled
-    if booking["status"] in ("accepted", "rejected"):
-        status_text = "✅ Qabul qilingan" if booking["status"] == "accepted" else "❌ Rad etilgan"
+    # Check if already handled or timed out
+    if booking["status"] in ("accepted", "rejected", "timeout"):
+        status_map = {
+            "accepted": "✅ Qabul qilingan",
+            "rejected": "❌ Rad etilgan", 
+            "timeout": "⏰ Vaqt tugagan",
+        }
+        status_text = status_map.get(booking["status"], booking["status"])
         await callback.message.edit_text(
             f"⚠️ Bu buyurtma allaqachon ko'rib chiqilgan.\n\nHolat: {status_text}",
             reply_markup=None

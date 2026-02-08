@@ -1,110 +1,99 @@
 """
-db_postgres.py — Async PostgreSQL database layer (asyncpg) for partner booking system.
+db_postgres.py - PostgreSQL Database Layer for Safar.uz Bot (Final Phase)
 
-Features:
-- asyncpg connection pool
-- auto schema creation (partners, bookings) with indices
-- supports partner connect (/connect) by connect_code
-- supports bookings (create, get, status updates, mark sent_at)
-- Railway-compatible: postgres:// -> postgresql:// normalize, SSL support
+Unified CMS architecture with:
+- listings table: hotels, guides, taxis, places
+- bookings table: references listings
 
-ENV:
-- DATABASE_URL (required)
-- DB_SSL (optional): "require" | "disable" (default: "require" on Railway)
+Uses asyncpg pool for Railway PostgreSQL.
 """
 
-from __future__ import annotations
-
-import os
+import asyncio
 import json
 import logging
-from uuid import UUID
+import os
+from datetime import datetime, timedelta
 from typing import Any, Optional
-
-import asyncpg
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
-_pool: Optional[asyncpg.Pool] = None
+# Global pool
+_pool = None
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _normalize_database_url(url: str) -> str:
-    """
-    Railway sometimes provides postgres://... which is valid in many libs,
-    but we normalize to postgresql://... just in case.
-    """
-    url = url.strip()
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://") :]
-    return url
+# =============================================================================
+# Schema SQL
+# =============================================================================
 
-
-def _should_require_ssl() -> bool:
-    """
-    On Railway, public endpoints typically need SSL.
-    You can override via DB_SSL=disable if you're sure.
-    """
-    v = os.getenv("DB_SSL", "").strip().lower()
-    if v in ("disable", "false", "0", "no"):
-        return False
-    if v in ("require", "true", "1", "yes"):
-        return True
-
-    # Auto-detect Railway env
-    # If running on Railway, it's safer to require SSL.
-    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
-        return True
-
-    # Default: require (safe)
-    return True
-
-
-# ---------------------------------------------------------------------
-# Schema (auto-create)
-# ---------------------------------------------------------------------
 _SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-CREATE TABLE IF NOT EXISTS partners (
-    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    type         text NOT NULL CHECK (type IN ('guide', 'hotel', 'taxi')),
-    display_name text NOT NULL,
-    connect_code text UNIQUE NOT NULL,
-    telegram_id  bigint UNIQUE,
-    is_active    boolean NOT NULL DEFAULT true,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-
-    latitude     double precision,
-    longitude    double precision,
-    address      text
+-- Listings table (unified for all categories)
+CREATE TABLE IF NOT EXISTS listings (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    region            text NOT NULL DEFAULT 'zomin',
+    category          text NOT NULL CHECK (category IN ('hotel', 'guide', 'taxi', 'place')),
+    subtype           text,
+    title             text NOT NULL,
+    description       text,
+    price_from        integer,
+    currency          text NOT NULL DEFAULT 'UZS',
+    phone             text,
+    telegram_admin_id bigint NOT NULL,
+    latitude          double precision,
+    longitude         double precision,
+    address           text,
+    photos            jsonb NOT NULL DEFAULT '[]'::jsonb,
+    is_active         boolean NOT NULL DEFAULT true,
+    created_at        timestamptz NOT NULL DEFAULT now()
 );
 
+-- Bookings table (references listings)
 CREATE TABLE IF NOT EXISTS bookings (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    service_type     text NOT NULL CHECK (service_type IN ('guide', 'hotel', 'taxi')),
-    partner_id       uuid NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+    listing_id       uuid NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
     user_telegram_id bigint NOT NULL,
     payload          jsonb NOT NULL DEFAULT '{}'::jsonb,
-    status           text NOT NULL DEFAULT 'new',
-    created_at       timestamptz NOT NULL DEFAULT now(),
-    sent_at          timestamptz
+    status           text NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'sent', 'accepted', 'rejected', 'timeout')),
+    expires_at       timestamptz,
+    created_at       timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_partners_type_active
-    ON partners(type, is_active);
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_listings_region_category
+    ON listings(region, category, is_active);
+
+CREATE INDEX IF NOT EXISTS idx_listings_admin
+    ON listings(telegram_admin_id);
+
+CREATE INDEX IF NOT EXISTS idx_bookings_listing_status
+    ON bookings(listing_id, status);
 
 CREATE INDEX IF NOT EXISTS idx_bookings_user_created
     ON bookings(user_telegram_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_bookings_partner_created
-    ON bookings(partner_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_bookings_status_created
-    ON bookings(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bookings_expires
+    ON bookings(expires_at, status) WHERE expires_at IS NOT NULL;
 """
+
+# Migration SQL for backward compatibility
+_MIGRATIONS_SQL = [
+    "ALTER TABLE listings ADD COLUMN IF NOT EXISTS currency text NOT NULL DEFAULT 'UZS'",
+    "ALTER TABLE listings ADD COLUMN IF NOT EXISTS phone text",
+    "ALTER TABLE listings ADD COLUMN IF NOT EXISTS latitude double precision",
+    "ALTER TABLE listings ADD COLUMN IF NOT EXISTS longitude double precision",
+    "ALTER TABLE listings ADD COLUMN IF NOT EXISTS address text",
+]
+
+
+def get_database_url() -> str:
+    """Get and normalize DATABASE_URL for asyncpg."""
+    url = os.getenv("DATABASE_URL", "")
+    
+    # Railway uses postgres:// but asyncpg needs postgresql://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    
+    return url
 
 
 async def ensure_schema() -> bool:
@@ -116,458 +105,342 @@ async def ensure_schema() -> bool:
 
     try:
         async with _pool.acquire() as conn:
-            # asyncpg can execute multiple statements separated by semicolons
+            # Create tables and indexes
             await conn.execute(_SCHEMA_SQL)
-        logger.info("DB schema ensured (partners, bookings)")
+            
+            # Run migrations
+            for sql in _MIGRATIONS_SQL:
+                try:
+                    await conn.execute(sql)
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        logger.warning(f"Migration warning: {e}")
+                        
+        logger.info("DB schema ensured (listings, bookings)")
         return True
     except Exception as e:
         logger.exception(f"Failed to ensure schema: {e}")
         return False
 
 
-# ---------------------------------------------------------------------
-# Pool lifecycle
-# ---------------------------------------------------------------------
-async def init_db_pool() -> bool:
-    """
-    Initialize PostgreSQL pool and ensure schema.
-    Must be called before any other DB operations.
-    """
+# =============================================================================
+# Pool Lifecycle
+# =============================================================================
+
+async def init_pool() -> bool:
+    """Initialize asyncpg connection pool."""
     global _pool
-
+    
     if _pool:
+        logger.info("Pool already initialized")
         return True
-
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if not database_url:
+    
+    url = get_database_url()
+    if not url:
         logger.error("DATABASE_URL not set")
         return False
-
-    database_url = _normalize_database_url(database_url)
-    require_ssl = _should_require_ssl()
-
+    
     try:
+        import asyncpg
+        
+        # Railway may require SSL
+        ssl_mode = os.getenv("PGSSLMODE", "prefer")
+        
         _pool = await asyncpg.create_pool(
-            dsn=database_url,
-            min_size=1,
+            url,
+            min_size=2,
             max_size=10,
             command_timeout=30,
-            ssl="require" if require_ssl else None,
+            ssl=ssl_mode if ssl_mode != "disable" else None,
         )
+        
         logger.info("PostgreSQL pool initialized")
-
-        ok = await ensure_schema()
-        if not ok:
-            # If schema creation failed, close pool to avoid half-broken state
-            await close_db_pool()
-            return False
-
         return True
     except Exception as e:
-        logger.exception(f"Failed to create DB pool: {e}")
-        _pool = None
+        logger.exception(f"Failed to init pool: {e}")
         return False
 
 
-async def close_db_pool() -> None:
+async def close_pool():
+    """Close the connection pool."""
     global _pool
-    try:
-        if _pool:
-            await _pool.close()
-            logger.info("PostgreSQL pool closed")
-    finally:
+    if _pool:
+        await _pool.close()
         _pool = None
+        logger.info("PostgreSQL pool closed")
 
 
 async def healthcheck() -> tuple[bool, str]:
-    """Basic healthcheck: can we read partners count?"""
+    """Check database connectivity."""
+    global _pool
     if not _pool:
         return False, "Pool not initialized"
-    try:
-        async with _pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM partners")
-            return True, f"OK ({count} partners)"
-    except Exception as e:
-        return False, f"Error: {e}"
-
-
-# ---------------------------------------------------------------------
-# Partner functions
-# ---------------------------------------------------------------------
-async def fetch_partners_by_type(partner_type: str) -> list[dict]:
-    """Fetch active partners by type ('guide', 'taxi', 'hotel')."""
-    if not _pool:
-        logger.error("DB pool not initialized")
-        return []
-
-    partner_type = partner_type.strip().lower()
-
-    try:
-        async with _pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, display_name, telegram_id
-                FROM partners
-                WHERE type = $1 AND is_active = true
-                ORDER BY display_name
-                """,
-                partner_type,
-            )
-            return [
-                {
-                    "id": str(r["id"]),
-                    "display_name": r["display_name"],
-                    "telegram_id": r["telegram_id"],
-                }
-                for r in rows
-            ]
-    except Exception as e:
-        logger.exception(f"Error fetching partners by type={partner_type}: {e}")
-        return []
-
-
-async def get_partner_by_id(partner_id: str) -> Optional[dict]:
-    """Get partner by UUID string, including location fields."""
-    if not _pool:
-        logger.error("DB pool not initialized")
-        return None
-
-    try:
-        pid = UUID(partner_id)
-    except Exception:
-        return None
-
-    try:
-        async with _pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, type, display_name, connect_code, telegram_id, is_active, created_at,
-                       latitude, longitude, address
-                FROM partners
-                WHERE id = $1
-                """,
-                pid,
-            )
-            if not row:
-                return None
-            return {
-                "id": str(row["id"]),
-                "type": row["type"],
-                "display_name": row["display_name"],
-                "connect_code": row["connect_code"],
-                "telegram_id": row["telegram_id"],
-                "is_active": row["is_active"],
-                "created_at": row["created_at"],
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-                "address": row["address"],
-            }
-    except Exception as e:
-        logger.exception(f"Error getting partner by id={partner_id}: {e}")
-        return None
-
-
-async def get_partner_location(partner_id: str) -> tuple[float, float, str] | None:
-    """
-    Get partner location (lat, lng, address) by UUID.
-    Returns tuple (latitude, longitude, address) or None if not found or no location.
-    """
-    partner = await get_partner_by_id(partner_id)
-    if not partner:
-        return None
     
-    lat = partner.get("latitude")
-    lng = partner.get("longitude")
-    address = partner.get("address") or ""
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1")
+            return result == 1, "OK"
+    except Exception as e:
+        return False, str(e)
+
+
+# =============================================================================
+# Listings CRUD
+# =============================================================================
+
+async def create_listing(data: dict[str, Any]) -> Optional[str]:
+    """
+    Create a new listing.
     
-    if lat is None or lng is None:
-        return None
-    
-    return (float(lat), float(lng), address)
-
-
-async def get_partner_by_code(connect_code: str) -> Optional[dict]:
-    """Get partner by connect_code (for admin testing)."""
+    Returns:
+        Listing UUID string or None on error
+    """
     if not _pool:
-        logger.error("DB pool not initialized")
-        return None
-
-    connect_code = connect_code.strip().upper()
-    if not connect_code:
         return None
 
     try:
         async with _pool.acquire() as conn:
-            row = await conn.fetchrow(
+            listing_id = await conn.fetchval(
                 """
-                SELECT id, type, display_name, connect_code, telegram_id, is_active,
-                       latitude, longitude, address
-                FROM partners
-                WHERE UPPER(connect_code) = $1
-                """,
-                connect_code,
-            )
-            if not row:
-                return None
-            return {
-                "id": str(row["id"]),
-                "type": row["type"],
-                "display_name": row["display_name"],
-                "connect_code": row["connect_code"],
-                "telegram_id": row["telegram_id"],
-                "is_active": row["is_active"],
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-                "address": row["address"],
-            }
-    except Exception as e:
-        logger.exception(f"Error getting partner by code={connect_code}: {e}")
-        return None
-
-
-async def connect_partner(connect_code: str, telegram_id: int) -> Optional[dict]:
-    """
-    Partner botga /connect CODE yuboradi.
-    Biz partner telegram_id ni DB'ga bog'lab qo'yamiz.
-    """
-    if not _pool:
-        logger.error("DB pool not initialized")
-        return None
-
-    connect_code = connect_code.strip()
-    if not connect_code:
-        return None
-
-    try:
-        async with _pool.acquire() as conn:
-            partner = await conn.fetchrow(
-                """
-                SELECT id, type, display_name, is_active
-                FROM partners
-                WHERE connect_code = $1
-                """,
-                connect_code,
-            )
-            if not partner or not partner["is_active"]:
-                return None
-
-            # telegram_id unique bo‘lgani uchun conflict bo‘lsa ham tushunarli log bo‘lsin
-            await conn.execute(
-                """
-                UPDATE partners
-                SET telegram_id = $1
-                WHERE connect_code = $2
-                """,
-                int(telegram_id),
-                connect_code,
-            )
-
-            return {
-                "id": str(partner["id"]),
-                "type": partner["type"],
-                "display_name": partner["display_name"],
-            }
-    except asyncpg.UniqueViolationError:
-        logger.warning("This telegram_id is already linked to another partner")
-        return None
-    except Exception as e:
-        logger.exception(f"Error connecting partner (code={connect_code}): {e}")
-        return None
-
-
-async def get_all_partners() -> list[dict]:
-    """Admin uchun: hamma partnerlar."""
-    if not _pool:
-        logger.error("DB pool not initialized")
-        return []
-
-    try:
-        async with _pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, type, display_name, connect_code, telegram_id, is_active,
-                       latitude, longitude, address
-                FROM partners
-                ORDER BY type, display_name
-                """
-            )
-            return [
-                {
-                    "id": str(r["id"]),
-                    "type": r["type"],
-                    "display_name": r["display_name"],
-                    "connect_code": r["connect_code"],
-                    "telegram_id": r["telegram_id"],
-                    "is_active": r["is_active"],
-                    "latitude": r["latitude"],
-                    "longitude": r["longitude"],
-                    "address": r["address"],
-                }
-                for r in rows
-            ]
-    except Exception as e:
-        logger.exception(f"Error fetching all partners: {e}")
-        return []
-
-
-# Optional: seed partners (4 guide, 5 taxi, 0/any hotel)
-async def seed_partners(sample_guides: list[dict], sample_taxis: list[dict], sample_hotels: list[dict] | None = None) -> int:
-    """
-    Insert sample partners. Each dict expected:
-    - type: 'guide'|'taxi'|'hotel'
-    - display_name
-    - connect_code
-    - is_active (optional)
-    - latitude/longitude/address (optional, mostly for hotels)
-    """
-    if not _pool:
-        logger.error("DB pool not initialized")
-        return 0
-
-    items = []
-    for g in sample_guides:
-        g = dict(g)
-        g["type"] = "guide"
-        items.append(g)
-    for t in sample_taxis:
-        t = dict(t)
-        t["type"] = "taxi"
-        items.append(t)
-    if sample_hotels:
-        for h in sample_hotels:
-            h = dict(h)
-            h["type"] = "hotel"
-            items.append(h)
-
-    if not items:
-        return 0
-
-    inserted = 0
-    try:
-        async with _pool.acquire() as conn:
-            for it in items:
-                display_name = it["display_name"]
-                connect_code = it["connect_code"]
-                is_active = bool(it.get("is_active", True))
-                latitude = it.get("latitude")
-                longitude = it.get("longitude")
-                address = it.get("address")
-
-                # Upsert by connect_code (kechroq qayta seed qilsa duplicate bo‘lmasin)
-                await conn.execute(
-                    """
-                    INSERT INTO partners(type, display_name, connect_code, is_active, latitude, longitude, address)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    ON CONFLICT (connect_code)
-                    DO UPDATE SET
-                        type = EXCLUDED.type,
-                        display_name = EXCLUDED.display_name,
-                        is_active = EXCLUDED.is_active,
-                        latitude = EXCLUDED.latitude,
-                        longitude = EXCLUDED.longitude,
-                        address = EXCLUDED.address
-                    """,
-                    it["type"],
-                    display_name,
-                    connect_code,
-                    is_active,
-                    latitude,
-                    longitude,
-                    address,
+                INSERT INTO listings(
+                    region, category, subtype, title, description,
+                    price_from, currency, phone, telegram_admin_id,
+                    latitude, longitude, address, photos, is_active
                 )
-                inserted += 1
-        return inserted
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, true)
+                RETURNING id
+                """,
+                data.get("region", "zomin").lower(),
+                data.get("category", "").lower(),
+                data.get("subtype"),
+                data.get("title", ""),
+                data.get("description"),
+                data.get("price_from"),
+                data.get("currency", "UZS"),
+                data.get("phone"),
+                int(data.get("telegram_admin_id", 0)),
+                data.get("latitude"),
+                data.get("longitude"),
+                data.get("address"),
+                json.dumps(data.get("photos", [])),
+            )
+            logger.info(f"Created listing {listing_id}")
+            return str(listing_id) if listing_id else None
     except Exception as e:
-        logger.exception(f"Error seeding partners: {e}")
-        return 0
+        logger.exception(f"Error creating listing: {e}")
+        return None
 
 
-async def seed_partners_default() -> dict:
-    """
-    Seed default sample partners (4 guides, 5 taxis, 2 hotels).
-    Returns dict with inserted count and total.
-    """
-    sample_guides = [
-        {"display_name": "Akmal - Samarqand gidi", "connect_code": "GUIDE-001"},
-        {"display_name": "Dilshod - Buxoro gidi", "connect_code": "GUIDE-002"},
-        {"display_name": "Malika - Xiva gidi", "connect_code": "GUIDE-003"},
-        {"display_name": "Jasur - Toshkent gidi", "connect_code": "GUIDE-004"},
-    ]
-    
-    sample_taxis = [
-        {"display_name": "Tez Taksi - Toshkent", "connect_code": "TAXI-001"},
-        {"display_name": "Samarqand Express", "connect_code": "TAXI-002"},
-        {"display_name": "Buxoro Taksi", "connect_code": "TAXI-003"},
-        {"display_name": "Xiva Transport", "connect_code": "TAXI-004"},
-        {"display_name": "Farg'ona Taksi", "connect_code": "TAXI-005"},
-    ]
-    
-    sample_hotels = [
-        {
-            "display_name": "Hotel Ichan Qala - Xiva",
-            "connect_code": "HOTEL-001",
-            "latitude": 41.378889,
-            "longitude": 60.363889,
-            "address": "Xiva, Ichan Qala, Pahlavon Mahmud ko'chasi",
-        },
-        {
-            "display_name": "Samarqand Registan Plaza",
-            "connect_code": "HOTEL-002",
-            "latitude": 39.654167,
-            "longitude": 66.959722,
-            "address": "Samarqand, Registon maydoni yaqinida",
-        },
-    ]
-    
-    count = await seed_partners(sample_guides, sample_taxis, sample_hotels)
-    
-    # Get total count
-    partners = await get_all_partners()
-    
+async def get_listing(listing_id: str) -> Optional[dict]:
+    """Get a single listing by ID."""
+    if not _pool:
+        return None
+
+    try:
+        lid = UUID(listing_id)
+    except:
+        return None
+
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, region, category, subtype, title, description,
+                       price_from, currency, phone, telegram_admin_id,
+                       latitude, longitude, address, photos, is_active, created_at
+                FROM listings WHERE id = $1
+                """,
+                lid,
+            )
+            if not row:
+                return None
+            return _row_to_listing(row)
+    except Exception as e:
+        logger.exception(f"Error getting listing: {e}")
+        return None
+
+
+async def fetch_listings(
+    region: str = None,
+    category: str = None,
+    subtype: str = None,
+    active_only: bool = True,
+) -> list[dict]:
+    """Fetch listings with optional filters."""
+    if not _pool:
+        return []
+
+    try:
+        conditions = []
+        params = []
+        idx = 1
+
+        if active_only:
+            conditions.append("is_active = true")
+
+        if region:
+            conditions.append(f"region = ${idx}")
+            params.append(region.lower())
+            idx += 1
+
+        if category:
+            conditions.append(f"category = ${idx}")
+            params.append(category.lower())
+            idx += 1
+
+        if subtype:
+            conditions.append(f"subtype = ${idx}")
+            params.append(subtype.lower())
+            idx += 1
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, region, category, subtype, title, description,
+                       price_from, currency, phone, telegram_admin_id,
+                       latitude, longitude, address, photos, is_active, created_at
+                FROM listings
+                {where}
+                ORDER BY created_at DESC
+                """,
+                *params,
+            )
+            return [_row_to_listing(r) for r in rows]
+    except Exception as e:
+        logger.exception(f"Error fetching listings: {e}")
+        return []
+
+
+async def fetch_listings_by_admin(admin_id: int) -> list[dict]:
+    """Get all listings owned by a specific admin."""
+    if not _pool:
+        return []
+
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, region, category, subtype, title, description,
+                       price_from, currency, phone, telegram_admin_id,
+                       latitude, longitude, address, photos, is_active, created_at
+                FROM listings
+                WHERE telegram_admin_id = $1
+                ORDER BY created_at DESC
+                """,
+                int(admin_id),
+            )
+            return [_row_to_listing(r) for r in rows]
+    except Exception as e:
+        logger.exception(f"Error fetching listings by admin: {e}")
+        return []
+
+
+async def toggle_listing_active(listing_id: str, is_active: bool) -> bool:
+    """Toggle listing active status."""
+    if not _pool:
+        return False
+
+    try:
+        lid = UUID(listing_id)
+    except:
+        return False
+
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                "UPDATE listings SET is_active = $1 WHERE id = $2",
+                is_active,
+                lid,
+            )
+            return res == "UPDATE 1"
+    except Exception as e:
+        logger.exception(f"Error toggling listing: {e}")
+        return False
+
+
+async def delete_listing(listing_id: str) -> bool:
+    """Delete a listing."""
+    if not _pool:
+        return False
+
+    try:
+        lid = UUID(listing_id)
+    except:
+        return False
+
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute("DELETE FROM listings WHERE id = $1", lid)
+            return res == "DELETE 1"
+    except Exception as e:
+        logger.exception(f"Error deleting listing: {e}")
+        return False
+
+
+def _row_to_listing(row) -> dict:
+    """Convert asyncpg row to listing dict."""
     return {
-        "inserted": count,
-        "updated": 0,
-        "total": len(partners),
+        "id": str(row["id"]),
+        "region": row["region"],
+        "category": row["category"],
+        "subtype": row["subtype"],
+        "title": row["title"],
+        "description": row["description"],
+        "price_from": row["price_from"],
+        "currency": row["currency"],
+        "phone": row["phone"],
+        "telegram_admin_id": row["telegram_admin_id"],
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
+        "address": row["address"],
+        "photos": list(row["photos"]) if row["photos"] else [],
+        "is_active": row["is_active"],
+        "created_at": row["created_at"],
     }
 
 
-# ---------------------------------------------------------------------
-# Booking functions
-# ---------------------------------------------------------------------
+# =============================================================================
+# Bookings CRUD
+# =============================================================================
+
 async def create_booking(
-    service_type: str,
-    partner_id: str,
+    listing_id: str,
     user_telegram_id: int,
-    payload: dict[str, Any],
-    status: str = "new",
+    payload: dict,
+    expires_minutes: int = 5,
 ) -> Optional[str]:
-    """Create booking row; returns booking_id."""
+    """
+    Create a new booking with expiration.
+    
+    Returns:
+        Booking UUID string or None on error
+    """
     if not _pool:
-        logger.error("DB pool not initialized")
-        return None
-
-    service_type = service_type.strip().lower()
-    status = status.strip().lower()
-
-    try:
-        pid = UUID(partner_id)
-    except Exception:
         return None
 
     try:
+        lid = UUID(listing_id)
+    except:
+        return None
+
+    try:
+        expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
+        
         async with _pool.acquire() as conn:
             booking_id = await conn.fetchval(
                 """
-                INSERT INTO bookings(service_type, partner_id, user_telegram_id, payload, status)
-                VALUES ($1, $2, $3, $4::jsonb, $5)
+                INSERT INTO bookings(listing_id, user_telegram_id, payload, status, expires_at)
+                VALUES ($1, $2, $3::jsonb, 'new', $4)
                 RETURNING id
                 """,
-                service_type,
-                pid,
+                lid,
                 int(user_telegram_id),
-                json.dumps(payload or {}),
-                status,
+                json.dumps(payload),
+                expires_at,
             )
+            logger.info(f"Created booking {booking_id}")
             return str(booking_id) if booking_id else None
     except Exception as e:
         logger.exception(f"Error creating booking: {e}")
@@ -575,63 +448,51 @@ async def create_booking(
 
 
 async def get_booking(booking_id: str) -> Optional[dict]:
-    """Get booking by id."""
+    """Get a booking by ID."""
     if not _pool:
-        logger.error("DB pool not initialized")
         return None
 
     try:
         bid = UUID(booking_id)
-    except Exception:
+    except:
         return None
 
     try:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, service_type, partner_id, user_telegram_id, payload, status, created_at, sent_at
-                FROM bookings
-                WHERE id = $1
+                SELECT b.id, b.listing_id, b.user_telegram_id, b.payload,
+                       b.status, b.expires_at, b.created_at,
+                       l.title as listing_title, l.category, l.telegram_admin_id,
+                       l.price_from, l.currency
+                FROM bookings b
+                JOIN listings l ON b.listing_id = l.id
+                WHERE b.id = $1
                 """,
                 bid,
             )
             if not row:
                 return None
-            return {
-                "id": str(row["id"]),
-                "service_type": row["service_type"],
-                "partner_id": str(row["partner_id"]),
-                "user_telegram_id": row["user_telegram_id"],
-                "payload": dict(row["payload"]) if row["payload"] else {},
-                "status": row["status"],
-                "created_at": row["created_at"],
-                "sent_at": row["sent_at"],
-            }
+            return _row_to_booking(row)
     except Exception as e:
         logger.exception(f"Error getting booking: {e}")
         return None
 
 
-async def set_booking_status(booking_id: str, status: str) -> bool:
+async def update_booking_status(booking_id: str, status: str) -> bool:
     """Update booking status."""
     if not _pool:
-        logger.error("DB pool not initialized")
         return False
 
     try:
         bid = UUID(booking_id)
-    except Exception:
+    except:
         return False
 
-    status = status.strip().lower()
     try:
         async with _pool.acquire() as conn:
             res = await conn.execute(
-                """
-                UPDATE bookings
-                SET status = $1
-                WHERE id = $2
-                """,
+                "UPDATE bookings SET status = $1 WHERE id = $2",
                 status,
                 bid,
             )
@@ -641,93 +502,96 @@ async def set_booking_status(booking_id: str, status: str) -> bool:
         return False
 
 
-async def get_bookings_by_user(user_telegram_id: int, limit: int = 10) -> list[dict]:
-    """Userning oxirgi bookinglari."""
+async def fetch_expired_bookings() -> list[dict]:
+    """
+    Atomically fetch and mark expired bookings as timeout.
+    Uses UPDATE ... RETURNING to be safe with multiple workers.
+    
+    Returns:
+        List of expired bookings (id, user_telegram_id, listing_title)
+    """
     if not _pool:
-        logger.error("DB pool not initialized")
         return []
 
     try:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT b.id, b.service_type, b.partner_id, b.payload, b.status, b.created_at, b.sent_at,
-                       p.display_name AS partner_name
-                FROM bookings b
-                LEFT JOIN partners p ON p.id = b.partner_id
-                WHERE b.user_telegram_id = $1
-                ORDER BY b.created_at DESC
-                LIMIT $2
-                """,
-                int(user_telegram_id),
-                int(limit),
+                UPDATE bookings b
+                SET status = 'timeout'
+                FROM listings l
+                WHERE b.listing_id = l.id
+                  AND b.status IN ('new', 'sent')
+                  AND b.expires_at < NOW()
+                RETURNING b.id, b.user_telegram_id, l.title as listing_title
+                """
             )
             return [
                 {
                     "id": str(r["id"]),
-                    "service_type": r["service_type"],
-                    "partner_id": str(r["partner_id"]),
-                    "partner_name": r["partner_name"],
-                    "payload": dict(r["payload"]) if r["payload"] else {},
-                    "status": r["status"],
-                    "created_at": r["created_at"],
-                    "sent_at": r["sent_at"],
+                    "user_telegram_id": r["user_telegram_id"],
+                    "listing_title": r["listing_title"],
                 }
                 for r in rows
             ]
     except Exception as e:
-        logger.exception(f"Error fetching user bookings: {e}")
+        logger.exception(f"Error fetching expired bookings: {e}")
         return []
 
 
-async def update_booking_sent(booking_id: str) -> bool:
-    """Mark booking as sent_to_partner and set sent_at."""
+def _row_to_booking(row) -> dict:
+    """Convert asyncpg row to booking dict."""
+    return {
+        "id": str(row["id"]),
+        "listing_id": str(row["listing_id"]),
+        "user_telegram_id": row["user_telegram_id"],
+        "payload": dict(row["payload"]) if row["payload"] else {},
+        "status": row["status"],
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "listing_title": row.get("listing_title"),
+        "category": row.get("category"),
+        "telegram_admin_id": row.get("telegram_admin_id"),
+        "price_from": row.get("price_from"),
+        "currency": row.get("currency"),
+    }
+
+
+# =============================================================================
+# Stats (for admin health check)
+# =============================================================================
+
+async def get_listings_count() -> int:
+    """Get count of active listings."""
     if not _pool:
-        logger.error("DB pool not initialized")
-        return False
-
-    try:
-        bid = UUID(booking_id)
-    except Exception:
-        return False
-
+        return 0
     try:
         async with _pool.acquire() as conn:
-            res = await conn.execute(
-                """
-                UPDATE bookings
-                SET status = 'sent_to_partner', sent_at = NOW()
-                WHERE id = $1
-                """,
-                bid,
-            )
-            return res == "UPDATE 1"
-    except Exception as e:
-        logger.exception(f"Error updating booking sent: {e}")
-        return False
+            return await conn.fetchval("SELECT COUNT(*) FROM listings WHERE is_active = true") or 0
+    except:
+        return 0
 
 
-async def get_partner_telegram_id(partner_id: str) -> Optional[int]:
-    """Partner telegram_id ni olish (xabar yuborish uchun)."""
+async def get_bookings_count() -> int:
+    """Get total bookings count."""
     if not _pool:
-        logger.error("DB pool not initialized")
-        return None
-    try:
-        pid = UUID(partner_id)
-    except Exception:
-        return None
-
+        return 0
     try:
         async with _pool.acquire() as conn:
-            tg_id = await conn.fetchval(
-                """
-                SELECT telegram_id
-                FROM partners
-                WHERE id = $1 AND is_active = true
-                """,
-                pid,
+            return await conn.fetchval("SELECT COUNT(*) FROM bookings") or 0
+    except:
+        return 0
+
+
+async def get_bookings_by_status() -> dict[str, int]:
+    """Get booking counts grouped by status."""
+    if not _pool:
+        return {}
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT status, COUNT(*) as cnt FROM bookings GROUP BY status"
             )
-            return int(tg_id) if tg_id else None
-    except Exception as e:
-        logger.exception(f"Error getting partner telegram_id: {e}")
-        return None
+            return {r["status"]: r["cnt"] for r in rows}
+    except:
+        return {}

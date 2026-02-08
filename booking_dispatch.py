@@ -1,231 +1,323 @@
 """
-Universal booking dispatch system.
+booking_dispatch.py - Booking Dispatch + Partner Callbacks + Timeout (Final Phase)
 
-Sends booking requests to partners and handles failures gracefully.
-Notifies admins when partner is not connected.
+Features:
+- Dispatch booking to listing's telegram_admin_id
+- Partner accept/reject callbacks
+- User notifications
+- Background timeout checker task
 """
-import os
-import logging
-from datetime import datetime
-from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-import db_postgres as db_pg
-from config import ADMINS
+import asyncio
+import html
+import logging
+from typing import Optional
+
+from aiogram import Router, Bot, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+
+import db_postgres as db
 
 logger = logging.getLogger(__name__)
 
+booking_dispatch_router = Router(name="booking_dispatch")
 
-# =============================================================================
-# MESSAGE TEMPLATES
-# =============================================================================
-
-def format_guide_message(booking_id: str, payload: dict, user_info: dict) -> str:
-    """Format guide booking message for partner."""
-    return (
-        f"🧭 <b>YANGI GID SO'ROVI</b> #{booking_id[:8]}\n\n"
-        f"👤 <b>Mijoz:</b> {user_info.get('name', '—')}\n"
-        f"📱 <b>Telefon:</b> {user_info.get('phone', '—')}\n"
-        f"🆔 <b>Username:</b> {user_info.get('username', '—')}\n\n"
-        f"📅 <b>Sana:</b> {payload.get('date', '—')}\n"
-        f"📍 <b>Marshrut:</b> {payload.get('route', '—')}\n"
-        f"👥 <b>Odamlar:</b> {payload.get('people_count', '—')}\n"
-        f"📝 <b>Izoh:</b> {payload.get('note') or '—'}"
-    )
-
-
-def format_hotel_message(booking_id: str, payload: dict, user_info: dict, partner_name: str) -> str:
-    """Format hotel booking message for partner."""
-    return (
-        f"🏨 <b>YANGI MEHMONXONA BUYURTMASI</b> #{booking_id[:8]}\n\n"
-        f"👤 <b>Mijoz:</b> {user_info.get('name', '—')}\n"
-        f"📱 <b>Telefon:</b> {user_info.get('phone', '—')}\n"
-        f"🆔 <b>Username:</b> {user_info.get('username', '—')}\n\n"
-        f"📅 <b>Kirish:</b> {payload.get('date_from', '—')}\n"
-        f"📅 <b>Chiqish:</b> {payload.get('date_to', '—')}\n"
-        f"👥 <b>Mehmonlar:</b> {payload.get('guests', '—')}\n"
-        f"🛏 <b>Xona:</b> {payload.get('room_type') or '—'}\n"
-        f"📝 <b>Izoh:</b> {payload.get('note') or '—'}"
-    )
-
-
-def format_taxi_message(booking_id: str, payload: dict, user_info: dict) -> str:
-    """Format taxi booking message for partner."""
-    return (
-        f"🚖 <b>YANGI TAKSI SO'ROVI</b> #{booking_id[:8]}\n\n"
-        f"👤 <b>Mijoz:</b> {user_info.get('name', '—')}\n"
-        f"📱 <b>Telefon:</b> {user_info.get('phone', '—')}\n"
-        f"🆔 <b>Username:</b> {user_info.get('username', '—')}\n\n"
-        f"📍 <b>Qayerdan:</b> {payload.get('pickup_location', '—')}\n"
-        f"📍 <b>Qayerga:</b> {payload.get('dropoff_location', '—')}\n"
-        f"🕐 <b>Vaqt:</b> {payload.get('pickup_time', '—')}\n"
-        f"👥 <b>Yo'lovchilar:</b> {payload.get('passengers', '—')}\n"
-        f"📝 <b>Izoh:</b> {payload.get('note') or '—'}"
-    )
-
-
-def build_partner_action_keyboard(booking_id: str) -> InlineKeyboardMarkup:
-    """Build accept/reject keyboard for partner."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"bk:ok:{booking_id}"),
-            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"bk:no:{booking_id}"),
-        ]
-    ])
+# Background task reference
+_timeout_task: Optional[asyncio.Task] = None
+_bot_ref: Optional[Bot] = None
 
 
 # =============================================================================
-# ADMIN NOTIFICATIONS
+# HTML Safety
 # =============================================================================
 
-async def notify_admins_booking_failed(
-    bot: Bot,
-    booking_id: str,
-    partner_id: str,
-    partner_name: str,
-    partner_type: str,
-    reason: str
-):
-    """Notify admins when booking delivery fails."""
-    admin_message = (
-        f"⚠️ <b>Buyurtma yetkazilmadi</b>\n\n"
-        f"🆔 Buyurtma: <code>{booking_id[:8]}...</code>\n"
-        f"👤 Partner: {partner_name} ({partner_type})\n"
-        f"🔗 Partner ID: <code>{partner_id[:8]}...</code>\n"
-        f"❌ Sabab: {reason}\n\n"
-        f"Iltimos, mijoz bilan bog'laning."
-    )
-    
-    for admin_id in ADMINS:
-        try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=admin_message,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+def h(text) -> str:
+    """HTML-escape any value."""
+    if text is None:
+        return ""
+    return html.escape(str(text), quote=False)
+
+
+async def safe_send_html(bot: Bot, chat_id: int, text: str, reply_markup=None) -> Optional[int]:
+    """Send HTML message with fallback. Returns message_id or None."""
+    try:
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return msg.message_id
+    except TelegramBadRequest as e:
+        if "can't parse entities" in str(e).lower():
+            try:
+                msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=None,
+                    reply_markup=reply_markup,
+                )
+                return msg.message_id
+            except:
+                pass
+        logger.error(f"Failed to send message to {chat_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error sending to {chat_id}: {e}")
+        return None
 
 
 # =============================================================================
-# UNIVERSAL DISPATCH FUNCTION
+# Dispatch Booking to Partner Admin
 # =============================================================================
 
-async def dispatch_booking_to_partner(
-    bot: Bot,
-    booking_id: str,
-    partner_id: str,
-    service_type: str,
-    payload: dict,
-    user_info: dict,
-) -> tuple[bool, str]:
+async def dispatch_booking_to_admin(bot: Bot, booking_id: str) -> bool:
     """
-    Universal function to dispatch booking to partner.
-    
-    Args:
-        bot: Aiogram Bot instance
-        booking_id: UUID string of the booking
-        partner_id: UUID string of the partner
-        service_type: 'guide', 'hotel', or 'taxi'
-        payload: Booking details dict
-        user_info: Dict with 'name', 'phone', 'username'
+    Send booking details to the listing's admin for accept/reject.
     
     Returns:
-        (success: bool, message: str)
+        True if sent successfully
     """
-    # Load partner from DB
-    partner = await db_pg.get_partner_by_id(partner_id)
+    booking = await db.get_booking(booking_id)
+    if not booking:
+        logger.error(f"Booking {booking_id} not found for dispatch")
+        return False
     
-    if not partner:
-        logger.error(f"Partner {partner_id} not found for booking {booking_id}")
-        await db_pg.set_booking_status(booking_id, "failed_partner_not_found")
-        return False, "Partner topilmadi"
+    admin_id = booking.get("telegram_admin_id")
+    if not admin_id:
+        logger.error(f"No admin ID for booking {booking_id}")
+        return False
     
-    partner_telegram_id = partner.get("telegram_id")
-    partner_name = partner.get("display_name", "Partner")
-    partner_type = partner.get("type", service_type)
+    payload = booking.get("payload", {})
     
-    # Check if partner is connected
-    if not partner_telegram_id:
-        logger.warning(f"Partner {partner_name} not connected, booking {booking_id}")
+    # Build message
+    lines = [
+        "📬 <b>Yangi bron!</b>",
+        "",
+        f"📌 {h(booking.get('listing_title', 'Listing'))}",
+    ]
+    
+    if booking.get("price_from"):
+        lines.append(f"💰 {booking['price_from']:,} {booking.get('currency', 'UZS')}")
+    
+    lines.extend([
+        "",
+        f"👤 Ism: {h(payload.get('name', '—'))}",
+        f"📱 Telefon: {h(payload.get('phone', '—'))}",
+        f"📅 Sana: {h(payload.get('date', '—'))}",
+    ])
+    
+    if payload.get("note"):
+        lines.append(f"📝 Izoh: {h(payload['note'])}")
+    
+    lines.extend([
+        "",
+        "⏳ 5 daqiqa ichida javob bering!",
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"bk:ok:{booking_id[:8]}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"bk:no:{booking_id[:8]}"),
+        ]
+    ])
+    
+    message_id = await safe_send_html(bot, admin_id, "\n".join(lines), keyboard)
+    
+    if message_id:
+        # Update status to 'sent'
+        await db.update_booking_status(booking_id, "sent")
+        logger.info(f"Booking {booking_id[:8]} dispatched to admin {admin_id}")
+        return True
+    
+    return False
+
+
+# =============================================================================
+# Partner Accept/Reject Callbacks
+# =============================================================================
+
+@booking_dispatch_router.callback_query(F.data.startswith("bk:ok:"))
+async def accept_booking(callback: CallbackQuery, bot: Bot):
+    """Partner accepts booking."""
+    await callback.answer()
+    
+    bid_short = callback.data.split(":")[2]
+    
+    # Find full booking
+    booking = await find_booking_by_short_id(bid_short)
+    if not booking:
+        await callback.answer("Bron topilmadi", show_alert=True)
+        return
+    
+    # Check if already processed
+    if booking["status"] not in ("new", "sent"):
+        status_text = {
+            "accepted": "allaqachon qabul qilingan",
+            "rejected": "allaqachon rad etilgan",
+            "timeout": "vaqti o'tgan",
+        }.get(booking["status"], booking["status"])
         
-        # Update booking status
-        await db_pg.set_booking_status(booking_id, "failed_no_partner_connection")
+        await callback.answer(f"Bu bron {status_text}", show_alert=True)
+        return
+    
+    # Update status
+    success = await db.update_booking_status(booking["id"], "accepted")
+    
+    if success:
+        # Notify partner
+        try:
+            await callback.message.edit_text(
+                callback.message.text + "\n\n✅ <b>Qabul qilindi!</b>",
+                parse_mode="HTML",
+            )
+        except:
+            pass
         
-        # Notify admins
-        await notify_admins_booking_failed(
-            bot=bot,
-            booking_id=booking_id,
-            partner_id=partner_id,
-            partner_name=partner_name,
-            partner_type=partner_type,
-            reason="Partner Telegram hisobiga ulanmagan"
+        # Notify user
+        user_id = booking["user_telegram_id"]
+        await safe_send_html(
+            bot,
+            user_id,
+            f"✅ <b>Bron tasdiqlandi!</b>\n\n"
+            f"📌 {h(booking.get('listing_title', ''))}\n\n"
+            f"Tez orada siz bilan bog'lanishadi.",
         )
         
-        return False, "Partner hali ulanmagan. Jamoamiz siz bilan bog'lanadi."
-    
-    # Format message based on service type
-    if service_type == "guide":
-        message_text = format_guide_message(booking_id, payload, user_info)
-    elif service_type == "hotel":
-        message_text = format_hotel_message(booking_id, payload, user_info, partner_name)
-    elif service_type == "taxi":
-        message_text = format_taxi_message(booking_id, payload, user_info)
+        logger.info(f"Booking {booking['id'][:8]} accepted")
     else:
-        message_text = f"📋 <b>Yangi buyurtma</b> #{booking_id[:8]}\n\n{payload}"
+        await callback.answer("Xatolik yuz berdi", show_alert=True)
+
+
+@booking_dispatch_router.callback_query(F.data.startswith("bk:no:"))
+async def reject_booking(callback: CallbackQuery, bot: Bot):
+    """Partner rejects booking."""
+    await callback.answer()
     
-    # Send to partner
+    bid_short = callback.data.split(":")[2]
+    
+    booking = await find_booking_by_short_id(bid_short)
+    if not booking:
+        await callback.answer("Bron topilmadi", show_alert=True)
+        return
+    
+    if booking["status"] not in ("new", "sent"):
+        await callback.answer("Bu bron allaqachon jarayonda", show_alert=True)
+        return
+    
+    success = await db.update_booking_status(booking["id"], "rejected")
+    
+    if success:
+        # Notify partner
+        try:
+            await callback.message.edit_text(
+                callback.message.text + "\n\n❌ <b>Rad etildi</b>",
+                parse_mode="HTML",
+            )
+        except:
+            pass
+        
+        # Notify user
+        user_id = booking["user_telegram_id"]
+        await safe_send_html(
+            bot,
+            user_id,
+            f"❌ <b>Bron rad etildi</b>\n\n"
+            f"📌 {h(booking.get('listing_title', ''))}\n\n"
+            f"Boshqa variantlarni ko'rish: /browse",
+        )
+        
+        logger.info(f"Booking {booking['id'][:8]} rejected")
+    else:
+        await callback.answer("Xatolik yuz berdi", show_alert=True)
+
+
+async def find_booking_by_short_id(bid_short: str) -> Optional[dict]:
+    """Find booking by short ID prefix."""
+    if not db._pool:
+        return None
+    
     try:
-        await bot.send_message(
-            chat_id=partner_telegram_id,
-            text=message_text,
-            parse_mode="HTML",
-            reply_markup=build_partner_action_keyboard(booking_id)
-        )
-        
-        # For hotels, also send location if available
-        if service_type == "hotel":
-            lat = partner.get("latitude")
-            lng = partner.get("longitude")
-            address = partner.get("address")
-            
-            if lat and lng:
-                try:
-                    # Send location to partner (so they see where booking is for)
-                    pass  # Partner already knows their hotel location
-                except Exception:
-                    pass
-            
-            # If hotel has an address, include Google Maps link in a follow-up
-            if lat and lng:
-                maps_link = f"https://maps.google.com/maps?q={lat},{lng}"
-                await bot.send_message(
-                    chat_id=partner_telegram_id,
-                    text=f"📍 <a href='{maps_link}'>Xaritada ko'rish</a>",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-        
-        # Update booking status
-        await db_pg.update_booking_sent(booking_id)
-        
-        logger.info(f"Booking {booking_id} dispatched to partner {partner_name}")
-        return True, "Buyurtma partnerga yuborildi"
-        
+        async with db._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT b.id, b.listing_id, b.user_telegram_id, b.payload,
+                       b.status, b.expires_at, b.created_at,
+                       l.title as listing_title, l.category, l.telegram_admin_id,
+                       l.price_from, l.currency
+                FROM bookings b
+                JOIN listings l ON b.listing_id = l.id
+                WHERE b.id::text LIKE $1
+                """,
+                bid_short + "%",
+            )
+            if row:
+                return db._row_to_booking(row)
     except Exception as e:
-        logger.error(f"Failed to send booking {booking_id} to partner: {e}")
-        
-        # Update status
-        await db_pg.set_booking_status(booking_id, "failed_send_error")
-        
-        # Notify admins
-        await notify_admins_booking_failed(
-            bot=bot,
-            booking_id=booking_id,
-            partner_id=partner_id,
-            partner_name=partner_name,
-            partner_type=partner_type,
-            reason=f"Xabar yuborishda xatolik: {str(e)[:50]}"
-        )
-        
-        return False, "Xabar yuborishda xatolik. Jamoamiz siz bilan bog'lanadi."
+        logger.error(f"Error finding booking: {e}")
+    
+    return None
+
+
+# =============================================================================
+# Timeout Checker Background Task
+# =============================================================================
+
+async def timeout_checker_loop(bot: Bot):
+    """
+    Background task that checks for expired bookings every 30 seconds.
+    Uses atomic UPDATE RETURNING to be safe with multiple workers.
+    """
+    global _bot_ref
+    _bot_ref = bot
+    
+    logger.info("Timeout checker started")
+    
+    while True:
+        try:
+            await asyncio.sleep(30)
+            
+            expired = await db.fetch_expired_bookings()
+            
+            for booking in expired:
+                user_id = booking["user_telegram_id"]
+                title = booking.get("listing_title", "")
+                
+                await safe_send_html(
+                    bot,
+                    user_id,
+                    f"⏰ <b>Vaqt tugadi</b>\n\n"
+                    f"📌 {h(title)}\n\n"
+                    f"Javob bo'lmadi, keyinroq urinib ko'ring.\n"
+                    f"/browse - Boshqa variantlar",
+                )
+                
+                logger.info(f"Booking {booking['id'][:8]} timed out")
+                
+        except asyncio.CancelledError:
+            logger.info("Timeout checker cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in timeout checker: {e}")
+            await asyncio.sleep(5)
+
+
+def start_timeout_checker(bot: Bot) -> asyncio.Task:
+    """Start the timeout checker background task."""
+    global _timeout_task
+    _timeout_task = asyncio.create_task(timeout_checker_loop(bot))
+    return _timeout_task
+
+
+async def stop_timeout_checker():
+    """Stop the timeout checker."""
+    global _timeout_task
+    if _timeout_task:
+        _timeout_task.cancel()
+        try:
+            await _timeout_task
+        except asyncio.CancelledError:
+            pass
+        _timeout_task = None
+        logger.info("Timeout checker stopped")

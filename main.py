@@ -1,18 +1,17 @@
 """
-Safar.uz Telegram Bot - Main Entry Point (Production Hardened)
+main.py - Safar.uz Telegram Bot Entry Point (Final Phase)
 
-Features:
-- PostgreSQL persistence (partners + bookings)
-- SQLite persistence (users + legacy orders)
-- Multi-language support (UZ/RU/EN)
-- Partner-based booking flow (Guide, Taxi)
-- Admin commands (/orders, /order, /find, /filter, /export, /health, /partners)
-- Rate limiting for anti-spam
-- Automated daily database backups
-- Global error logging with admin notifications
-- Graceful shutdown handling
+Unified CMS architecture:
+- listings table for all categories
+- bookings table with 5-minute timeout
+- Partner admin management via /add, /my_listings
+- User browsing via /browse
+
+Railway + PostgreSQL (asyncpg)
 """
+
 import asyncio
+import logging
 import os
 import sys
 from contextlib import suppress
@@ -22,138 +21,144 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Import config first to validate environment variables
-from config import BOT_TOKEN, ADMINS, get_startup_info
-from handlers import router
-from admin_commands import admin_router
-from partner_handlers import partner_router
-from booking_handlers import booking_router
-import db
-import db_postgres as db_pg
-import backup
-from error_logging import setup_error_handler
-from logging_config import setup_logging, get_logger
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMINS_RAW = os.getenv("ADMINS", "")
+ADMINS = [int(x.strip()) for x in ADMINS_RAW.split(",") if x.strip().isdigit()]
 
-# Initialize logging
-setup_logging()
-logger = get_logger(__name__)
+if not BOT_TOKEN:
+    print("❌ ERROR: BOT_TOKEN not set!")
+    sys.exit(1)
 
-# Track bot start time for /health command
-BOT_START_TIME: float = 0.0
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Import modules
+import db_postgres as db
+from listing_wizard import listing_wizard_router
+from listings_user_flow import user_flow_router
+from booking_dispatch import booking_dispatch_router, start_timeout_checker, stop_timeout_checker
 
 
 def get_storage():
-    """
-    Get FSM storage based on environment.
-    
-    If REDIS_URL is set, uses RedisStorage for persistence across restarts.
-    Falls back to MemoryStorage for local development.
-    
-    WARNING: MemoryStorage loses all FSM state on restart!
-    """
+    """Get FSM storage. Uses Redis if REDIS_URL set, else MemoryStorage."""
     redis_url = os.getenv("REDIS_URL", "").strip()
     if redis_url:
         try:
             from aiogram.fsm.storage.redis import RedisStorage
-            logger.info("Using Redis storage for FSM persistence")
+            logger.info("Using Redis storage for FSM")
             return RedisStorage.from_url(redis_url)
-        except ImportError:
-            logger.warning("redis package not installed, falling back to MemoryStorage")
         except Exception as e:
-            logger.warning(f"Failed to connect to Redis: {e}, falling back to MemoryStorage")
-    
-    logger.warning("Using MemoryStorage - FSM state will be lost on restart!")
+            logger.warning(f"Redis unavailable, using memory: {e}")
     return MemoryStorage()
 
 
-async def healthcheck_db() -> tuple[bool, str]:
-    """Check database connectivity. Returns (ok, message)."""
-    try:
-        count = await asyncio.to_thread(db.get_orders_count)
-        return True, f"SQLite OK ({count} orders)"
-    except Exception as e:
-        return False, f"SQLite Error: {e}"
-
-
-async def healthcheck_postgres() -> tuple[bool, str]:
-    """Check PostgreSQL connectivity."""
-    return await db_pg.healthcheck()
-
-
 async def main():
-    """Initialize and start the bot with production hardening."""
-    global BOT_START_TIME
-    import time
-    BOT_START_TIME = time.time()
+    """Main bot entry point."""
+    logger.info("Starting Safar.uz Bot (Final Phase)...")
+    logger.info(f"Admins: {ADMINS}")
     
-    # Startup banner
-    startup_info = get_startup_info()
-    print("=" * 60)
-    print(f"🚀 Safar.uz Bot Starting | {startup_info}")
-    print(f"📢 Admins: {ADMINS}")
-    print("=" * 60)
-    logger.info(f"Bot starting: {startup_info}", extra={"admins": ADMINS})
-    
-    # Initialize SQLite database (legacy)
-    if not db.init_db():
-        logger.error("FATAL: SQLite database initialization failed!")
+    # Initialize database
+    if not await db.init_pool():
+        logger.error("Failed to initialize database pool!")
         sys.exit(1)
     
-    db_ok, db_msg = await healthcheck_db()
-    if db_ok:
-        logger.info(f"SQLite health check: {db_msg}")
-    else:
-        logger.warning(f"SQLite health check failed: {db_msg}")
+    if not await db.ensure_schema():
+        logger.error("Failed to ensure database schema!")
+        sys.exit(1)
     
-    # Initialize PostgreSQL database (REQUIRED for partner features)
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if database_url:
-        logger.info("Initializing PostgreSQL connection pool...")
-        pg_ok = await db_pg.init_db_pool()
-        if pg_ok:
-            pg_health_ok, pg_health_msg = await healthcheck_postgres()
-            logger.info(f"PostgreSQL health check: {pg_health_msg}")
-            print(f"✅ PostgreSQL: {pg_health_msg}")
-        else:
-            logger.error("FATAL: PostgreSQL pool initialization failed!")
-            logger.error("Check DATABASE_URL and network connectivity.")
-            print("❌ PostgreSQL initialization FAILED - exiting")
-            sys.exit(1)
-    else:
-        logger.warning("DATABASE_URL not set - partner booking features DISABLED")
-        print("⚠️ DATABASE_URL not set - partner features disabled")
-    
-    # Ensure backup directory exists
-    backup.ensure_backup_dir()
-    
-    # Initialize bot with default parse mode
+    # Create bot and dispatcher
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     
-    # Initialize dispatcher with pluggable storage
-    dp = Dispatcher(storage=get_storage())
+    storage = get_storage()
+    dp = Dispatcher(storage=storage)
     
-    # Register global error handler
-    setup_error_handler(dp, bot)
+    # Register routers (order matters)
+    dp.include_router(listing_wizard_router)    # /add, /my_listings
+    dp.include_router(user_flow_router)         # /browse, booking flow
+    dp.include_router(booking_dispatch_router)  # Partner accept/reject
     
-    # Register routers (order matters for priority)
-    dp.include_router(admin_router)      # Admin commands first
-    dp.include_router(partner_router)    # Partner /connect and callbacks
-    dp.include_router(booking_router)    # Guide/Taxi booking flows
-    dp.include_router(router)            # Legacy handlers
-
-    # Delete any pending updates (clean start)
+    # Add /start and /help handlers
+    from aiogram.types import Message
+    from aiogram.filters import Command
+    
+    @dp.message(Command("start"))
+    async def cmd_start(message: Message):
+        """Handle /start command."""
+        await message.answer(
+            "🏔 <b>Safar.uz</b>\n\n"
+            "Zomin sayohatlaringiz uchun eng yaxshi takliflar!\n\n"
+            "📋 <b>Buyruqlar:</b>\n"
+            "/browse - Listinglarni ko'rish\n"
+            "/add - Yangi listing qo'shish (partnyorlar uchun)\n"
+            "/my_listings - Listinglaringizni boshqarish\n"
+            "/help - Yordam",
+            parse_mode="HTML",
+        )
+    
+    @dp.message(Command("help"))
+    async def cmd_help(message: Message):
+        """Handle /help command."""
+        await message.answer(
+            "📚 <b>Yordam</b>\n\n"
+            "<b>Foydalanuvchilar uchun:</b>\n"
+            "/browse - Mehmonxonalar, gidlar, taksini ko'rish\n"
+            "Listingni tanlab, bron qilishingiz mumkin\n\n"
+            "<b>Partnyorlar uchun:</b>\n"
+            "/add - Yangi listing qo'shish\n"
+            "/my_listings - Listinglaringizni boshqarish\n\n"
+            "<b>Admin:</b>\n"
+            "/health - Tizim holati",
+            parse_mode="HTML",
+        )
+    
+    @dp.message(Command("health"))
+    async def cmd_health(message: Message):
+        """Health check command."""
+        if message.from_user.id not in ADMINS:
+            return
+        
+        ok, msg = await db.healthcheck()
+        status = "✅" if ok else "❌"
+        
+        listings_count = await db.get_listings_count()
+        bookings_count = await db.get_bookings_count()
+        bookings_by_status = await db.get_bookings_by_status()
+        
+        lines = [
+            "🏥 <b>HEALTH CHECK</b>",
+            "",
+            f"PostgreSQL: {status} {msg}",
+            "",
+            f"📋 Listings (active): {listings_count}",
+            f"📝 Bookings (total): {bookings_count}",
+        ]
+        
+        if bookings_by_status:
+            status_line = ", ".join(f"{k}: {v}" for k, v in bookings_by_status.items())
+            lines.append(f"📊 By status: {status_line}")
+        
+        await message.answer("\n".join(lines), parse_mode="HTML")
+    
+    # Clean start
     await bot.delete_webhook(drop_pending_updates=True)
     
     logger.info("Bot initialized, starting polling...")
     print("✅ Bot is running! Press Ctrl+C to stop.")
     
-    # Start backup scheduler as background task
-    backup_task = asyncio.create_task(backup.backup_scheduler(bot))
+    # Start timeout checker
+    timeout_task = start_timeout_checker(bot)
+    logger.info("Timeout checker started (30s interval)")
     
-    # Start polling with graceful shutdown
+    # Start polling
     try:
         await dp.start_polling(bot)
     except asyncio.CancelledError:
@@ -163,27 +168,19 @@ async def main():
         raise
     finally:
         logger.info("Shutting down...")
-        backup_task.cancel()
+        
+        await stop_timeout_checker()
+        
+        timeout_task.cancel()
         with suppress(asyncio.CancelledError):
-            await backup_task
+            await timeout_task
         
-        # Close PostgreSQL pool
-        await db_pg.close_db_pool()
-        
+        await db.close_pool()
         await bot.session.close()
-        logger.info("Bot stopped gracefully")
-        print("👋 Bot stopped. Goodbye!")
 
 
 if __name__ == "__main__":
-    # Handle Windows event loop policy
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Interrupted by user")
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        sys.exit(1)
+        print("\n👋 Bot stopped.")

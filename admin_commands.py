@@ -86,10 +86,12 @@ async def cmd_admin_help(message: Message):
 /admin_help - Show this help
 /admin_health - Database health check and partner stats
 /seed_partners - Seed sample partners (4 guides, 5 taxis, 2 hotels)
+/seed_listings - Seed sample listings for CMS browsing
 /partners - List all partners with details
 
 NON-ADMIN COMMANDS
-/connect CODE - Partner connects their Telegram account"""
+/connect CODE - Partner connects their Telegram account
+/browse - Start CMS browsing flow"""
     
     await message.answer(text, parse_mode=None)
 
@@ -98,7 +100,7 @@ NON-ADMIN COMMANDS
 # /admin_health
 # =============================================================================
 
-@router.message(Command("admin_health"))
+@admin_router.message(Command("admin_health"))
 async def cmd_admin_health(message: Message):
     """Database health check and partner statistics."""
     if not is_admin(message.from_user.id):
@@ -122,6 +124,23 @@ async def cmd_admin_health(message: Message):
         lines.append("Check DATABASE_URL and ensure PostgreSQL is running.")
         await message.answer("\n".join(lines), parse_mode=None)
         return
+    
+    # CMS Listings and Bookings counts
+    try:
+        listings_count = await db_pg.get_listings_count()
+        bookings_count = await db_pg.get_bookings_count()
+        bookings_by_status = await db_pg.get_bookings_by_status()
+        
+        lines.append("")
+        lines.append("📊 CMS STATISTICS")
+        lines.append(f"  📋 Listings (active): {listings_count}")
+        lines.append(f"  📝 Bookings (total): {bookings_count}")
+        
+        if bookings_by_status:
+            status_line = ", ".join(f"{k}: {v}" for k, v in bookings_by_status.items())
+            lines.append(f"  📈 By status: {status_line}")
+    except Exception as e:
+        lines.append(f"  ⚠️ CMS stats error: {e}")
     
     # Get all partners
     try:
@@ -176,6 +195,11 @@ async def cmd_admin_health(message: Message):
         lines.append("")
         lines.append("⚠️ No partners found!")
         lines.append("Run /seed_partners to create sample partners.")
+    
+    if listings_count == 0:
+        lines.append("")
+        lines.append("⚠️ No listings found!")
+        lines.append("Run /seed_listings to create sample listings.")
     
     total_active = len([p for p in all_partners if safe_get(p, "is_active", False)])
     if total_active == 0 and len(all_partners) > 0:
@@ -243,6 +267,37 @@ async def cmd_seed_partners(message: Message):
         logger.error(f"Error seeding partners: {e}")
         await message.answer(f"❌ Seeding failed: {e}", parse_mode=None)
 
+
+# =============================================================================
+# /seed_listings
+# =============================================================================
+
+@router.message(Command("seed_listings"))
+async def cmd_seed_listings(message: Message):
+    """Seed sample listings into database for CMS browsing."""
+    if not is_admin(message.from_user.id):
+        return
+    
+    await message.answer("🔄 Seeding listings...", parse_mode=None)
+    
+    try:
+        count = await db_pg.seed_sample_listings()
+        
+        # Get actual count from DB
+        listings_count = await db_pg.get_listings_count()
+        
+        text = (
+            f"✅ Seeding completed!\n\n"
+            f"Inserted: {count}\n"
+            f"Total active listings: {listings_count}\n\n"
+            f"💡 Users can now browse listings via /browse command"
+        )
+        
+        await message.answer(text, parse_mode=None)
+        
+    except Exception as e:
+        logger.error(f"Error seeding listings: {e}")
+        await message.answer(f"❌ Seeding failed: {e}", parse_mode=None)
 
 # =============================================================================
 # /partners
