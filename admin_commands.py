@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 # Create router
 router = Router(name="admin_commands")
 
+# Alias for main.py compatibility
+admin_router = router
+
 # Telegram message size limit (safe margin)
 MAX_MESSAGE_LENGTH = 4000
 
