@@ -1,5 +1,5 @@
 """
-User booking handlers for Guide and Taxi flows with partner selection.
+User booking handlers for Guide, Taxi, and Hotel flows with partner selection.
 """
 import logging
 from aiogram import Router, Bot, F
@@ -7,8 +7,9 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 
 import db_postgres as db_pg
-from states import GuideBooking, TaxiBooking
+from states import GuideBooking, TaxiBooking, HotelBooking
 from keyboards import get_main_menu, get_cancel_keyboard, get_confirm_keyboard
+from booking_dispatch import dispatch_booking_to_partner
 import db  # For get_user_lang
 
 logger = logging.getLogger(__name__)
@@ -198,17 +199,24 @@ async def guide_note_entered(message: Message, state: FSMContext):
 
 @booking_router.callback_query(F.data == "confirm:guide:yes")
 async def guide_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """Confirm guide booking - create in DB and notify partner."""
+    """Confirm guide booking - create in DB and dispatch to partner."""
     await callback.answer()
     
     data = await state.get_data()
-    user_id = callback.from_user.id if callback.from_user else 0
+    user = callback.from_user
+    user_id = user.id if user else 0
     
     payload = {
         "date": data.get("date", ""),
         "route": data.get("route", ""),
         "people_count": data.get("people_count", ""),
         "note": data.get("note", ""),
+    }
+    
+    user_info = {
+        "name": user.full_name if user else "—",
+        "username": f"@{user.username}" if user and user.username else "—",
+        "phone": data.get("phone", "—"),
     }
     
     # Create booking
@@ -228,47 +236,37 @@ async def guide_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot
         await state.clear()
         return
     
-    # Notify partner
-    partner_telegram_id = data.get("partner_telegram_id")
-    if partner_telegram_id:
-        try:
-            user_info = callback.from_user
-            username = f"@{user_info.username}" if user_info and user_info.username else "N/A"
-            
-            partner_message = (
-                f"🆕 <b>Yangi buyurtma!</b>\n\n"
-                f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
-                f"📅 <b>Sana:</b> {payload['date']}\n"
-                f"📍 <b>Marshrut:</b> {payload['route']}\n"
-                f"👥 <b>Odamlar:</b> {payload['people_count']}\n"
-                f"📝 <b>Izoh:</b> {payload['note'] or '-'}\n\n"
-                f"👤 <b>Mijoz:</b> {username}"
-            )
-            
-            await bot.send_message(
-                chat_id=partner_telegram_id,
-                text=partner_message,
-                parse_mode="HTML",
-                reply_markup=build_partner_action_keyboard(booking_id)
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify partner: {e}")
-    
-    await callback.message.edit_text(
-        f"✅ <b>Buyurtma yuborildi!</b>\n\n"
-        f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
-        f"👤 <b>Gid:</b> {data['partner_name']}\n\n"
-        f"Partner javobini kuting.",
-        parse_mode="HTML",
-        reply_markup=None
+    # Dispatch to partner using universal function
+    success, message = await dispatch_booking_to_partner(
+        bot=bot,
+        booking_id=booking_id,
+        partner_id=data["partner_id"],
+        service_type="guide",
+        payload=payload,
+        user_info=user_info,
     )
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ <b>Buyurtma yuborildi!</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"👤 <b>Gid:</b> {data['partner_name']}\n\n"
+            f"Partner javobini kuting.",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    else:
+        await callback.message.edit_text(
+            f"⚠️ <b>Buyurtma yaratildi</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"👤 <b>Gid:</b> {data['partner_name']}\n\n"
+            f"{message}",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    
     await state.clear()
-    
-    # Send main menu
-    await callback.message.answer(
-        "Bosh menyu:",
-        reply_markup=get_main_menu()
-    )
+    await callback.message.answer("Bosh menyu:", reply_markup=get_main_menu())
 
 
 @booking_router.callback_query(F.data == "confirm:guide:no")
@@ -440,11 +438,12 @@ async def taxi_note_entered(message: Message, state: FSMContext):
 
 @booking_router.callback_query(F.data == "confirm:taxi:yes")
 async def taxi_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """Confirm taxi booking - create in DB and notify partner."""
+    """Confirm taxi booking - create in DB and dispatch to partner."""
     await callback.answer()
     
     data = await state.get_data()
-    user_id = callback.from_user.id if callback.from_user else 0
+    user = callback.from_user
+    user_id = user.id if user else 0
     
     payload = {
         "pickup_location": data.get("pickup_location", ""),
@@ -452,6 +451,12 @@ async def taxi_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot)
         "pickup_time": data.get("pickup_time", ""),
         "passengers": data.get("passengers", ""),
         "note": data.get("note", ""),
+    }
+    
+    user_info = {
+        "name": user.full_name if user else "—",
+        "username": f"@{user.username}" if user and user.username else "—",
+        "phone": data.get("phone", "—"),
     }
     
     # Create booking
@@ -471,48 +476,37 @@ async def taxi_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await state.clear()
         return
     
-    # Notify partner
-    partner_telegram_id = data.get("partner_telegram_id")
-    if partner_telegram_id:
-        try:
-            user_info = callback.from_user
-            username = f"@{user_info.username}" if user_info and user_info.username else "N/A"
-            
-            partner_message = (
-                f"🆕 <b>Yangi buyurtma!</b>\n\n"
-                f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
-                f"📍 <b>Qayerdan:</b> {payload['pickup_location']}\n"
-                f"📍 <b>Qayerga:</b> {payload['dropoff_location']}\n"
-                f"🕐 <b>Vaqt:</b> {payload['pickup_time']}\n"
-                f"👥 <b>Yo'lovchilar:</b> {payload['passengers']}\n"
-                f"📝 <b>Izoh:</b> {payload['note'] or '-'}\n\n"
-                f"👤 <b>Mijoz:</b> {username}"
-            )
-            
-            await bot.send_message(
-                chat_id=partner_telegram_id,
-                text=partner_message,
-                parse_mode="HTML",
-                reply_markup=build_partner_action_keyboard(booking_id)
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify partner: {e}")
-    
-    await callback.message.edit_text(
-        f"✅ <b>Buyurtma yuborildi!</b>\n\n"
-        f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
-        f"🚕 <b>Taksi:</b> {data['partner_name']}\n\n"
-        f"Partner javobini kuting.",
-        parse_mode="HTML",
-        reply_markup=None
+    # Dispatch to partner using universal function
+    success, message = await dispatch_booking_to_partner(
+        bot=bot,
+        booking_id=booking_id,
+        partner_id=data["partner_id"],
+        service_type="taxi",
+        payload=payload,
+        user_info=user_info,
     )
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ <b>Buyurtma yuborildi!</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"🚕 <b>Taksi:</b> {data['partner_name']}\n\n"
+            f"Partner javobini kuting.",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    else:
+        await callback.message.edit_text(
+            f"⚠️ <b>Buyurtma yaratildi</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"🚕 <b>Taksi:</b> {data['partner_name']}\n\n"
+            f"{message}",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    
     await state.clear()
-    
-    # Send main menu
-    await callback.message.answer(
-        "Bosh menyu:",
-        reply_markup=get_main_menu()
-    )
+    await callback.message.answer("Bosh menyu:", reply_markup=get_main_menu())
 
 
 @booking_router.callback_query(F.data == "confirm:taxi:no")
@@ -535,3 +529,294 @@ async def cancel_partner_selection(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Bekor qilindi.", reply_markup=None)
     await callback.message.answer("Bosh menyu:", reply_markup=get_main_menu())
+
+
+# =============================================================================
+# HOTEL FLOW (with location sending)
+# =============================================================================
+
+@booking_router.message(F.text == "🏨 Mehmonxona bron")
+async def start_hotel_booking(message: Message, state: FSMContext):
+    """Start hotel booking - show available hotels."""
+    await state.clear()
+    
+    partners = await db_pg.fetch_partners_by_type("hotel")
+    
+    if not partners:
+        await message.answer(
+            "😔 Hozircha faol mehmonxonalar yo'q.\n"
+            "Iltimos, keyinroq qaytadan urinib ko'ring.",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    await state.set_state(HotelBooking.selecting_partner)
+    await message.answer(
+        "🏨 <b>Mehmonxona tanlang:</b>\n\n"
+        "✅ - Ulangan (buyurtma qabul qiladi)\n"
+        "⏳ - Ulanmagan (kutish kerak)",
+        parse_mode="HTML",
+        reply_markup=build_partners_keyboard(partners, "hotel")
+    )
+
+
+@booking_router.callback_query(F.data.startswith("p:hotel:"))
+async def hotel_selected(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Hotel selected - send location first, then start booking flow."""
+    await callback.answer()
+    
+    partner_id = callback.data.split(":")[2]
+    partner = await db_pg.get_partner_by_id(partner_id)
+    
+    if not partner:
+        await callback.message.edit_text("❌ Mehmonxona topilmadi. Qaytadan urinib ko'ring.")
+        await state.clear()
+        return
+    
+    # Check if partner is connected
+    if not partner["telegram_id"]:
+        await callback.message.edit_text(
+            f"⚠️ <b>{partner['display_name']}</b> hali ulanmagan.\n\n"
+            "Iltimos, boshqa mehmonxonani tanlang yoki keyinroq qaytadan urinib ko'ring.",
+            parse_mode="HTML",
+            reply_markup=build_partners_keyboard(await db_pg.fetch_partners_by_type("hotel"), "hotel")
+        )
+        return
+    
+    # Save partner to state
+    await state.update_data(
+        partner_id=partner_id,
+        partner_name=partner["display_name"],
+        partner_telegram_id=partner["telegram_id"]
+    )
+    
+    # Edit the selection message
+    await callback.message.edit_text(
+        f"✅ Mehmonxona tanlandi: <b>{partner['display_name']}</b>",
+        parse_mode="HTML",
+        reply_markup=None
+    )
+    
+    # Send location if available
+    lat = partner.get("latitude")
+    lng = partner.get("longitude")
+    address = partner.get("address") or ""
+    
+    try:
+        if lat and lng:
+            # Send Telegram location message
+            await callback.message.answer_location(
+                latitude=lat,
+                longitude=lng
+            )
+            
+            # Send location info message
+            location_text = f"📍 <b>{partner['display_name']}</b> joylashuvi yuborildi."
+            if address:
+                location_text += f"\n\n🏠 <b>Manzil:</b> {address}"
+            location_text += "\n\nEndi buyurtma berish uchun ma'lumotlarni kiriting."
+            
+            await callback.message.answer(location_text, parse_mode="HTML")
+        elif address:
+            # No coordinates, but have address
+            await callback.message.answer(
+                f"🏠 <b>Manzil:</b> {address}\n\n"
+                "Endi buyurtma berish uchun ma'lumotlarni kiriting.",
+                parse_mode="HTML"
+            )
+        else:
+            # No location info at all
+            await callback.message.answer(
+                "📍 Joylashuv ma'lumoti mavjud emas.\n\n"
+                "Endi buyurtma berish uchun ma'lumotlarni kiriting.",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send hotel location: {e}")
+        await callback.message.answer(
+            "📍 Joylashuvni yuborishda xatolik.\n\n"
+            "Endi buyurtma berish uchun ma'lumotlarni kiriting.",
+            parse_mode="HTML"
+        )
+    
+    # Move to date_from step
+    await state.set_state(HotelBooking.date_from)
+    await callback.message.answer(
+        "📅 <b>Kirish sanasi (check-in):</b>\n"
+        "Misol: 15-fevral",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@booking_router.message(HotelBooking.date_from)
+async def hotel_date_from_entered(message: Message, state: FSMContext):
+    """Process hotel check-in date."""
+    text = message.text.strip() if message.text else ""
+    if not text or len(text) < 3:
+        await message.answer("❌ Iltimos, to'g'ri sana kiriting. Misol: 15-fevral")
+        return
+    
+    await state.update_data(date_from=text)
+    await state.set_state(HotelBooking.date_to)
+    await message.answer(
+        "📅 <b>Chiqish sanasi (check-out):</b>\n"
+        "Misol: 18-fevral",
+        parse_mode="HTML"
+    )
+
+
+@booking_router.message(HotelBooking.date_to)
+async def hotel_date_to_entered(message: Message, state: FSMContext):
+    """Process hotel check-out date."""
+    text = message.text.strip() if message.text else ""
+    if not text or len(text) < 3:
+        await message.answer("❌ Iltimos, to'g'ri sana kiriting. Misol: 18-fevral")
+        return
+    
+    await state.update_data(date_to=text)
+    await state.set_state(HotelBooking.guests)
+    await message.answer(
+        "👥 <b>Mehmonlar soni:</b>",
+        parse_mode="HTML"
+    )
+
+
+@booking_router.message(HotelBooking.guests)
+async def hotel_guests_entered(message: Message, state: FSMContext):
+    """Process hotel guests count."""
+    text = message.text.strip() if message.text else ""
+    if not text:
+        await message.answer("❌ Iltimos, mehmonlar sonini kiriting.")
+        return
+    
+    await state.update_data(guests=text)
+    await state.set_state(HotelBooking.room_type)
+    await message.answer(
+        "🛏 <b>Xona turi:</b>\n"
+        "Misol: Standart, Lyuks, 2 xonali\n"
+        "(yoki /skip bosing)",
+        parse_mode="HTML"
+    )
+
+
+@booking_router.message(HotelBooking.room_type)
+async def hotel_room_entered(message: Message, state: FSMContext):
+    """Process hotel room type."""
+    text = message.text.strip() if message.text else ""
+    room_type = "" if text == "/skip" else text
+    
+    await state.update_data(room_type=room_type)
+    await state.set_state(HotelBooking.note)
+    await message.answer(
+        "📝 <b>Qo'shimcha izoh:</b>\n"
+        "(yoki /skip bosing)",
+        parse_mode="HTML"
+    )
+
+
+@booking_router.message(HotelBooking.note)
+async def hotel_note_entered(message: Message, state: FSMContext):
+    """Process hotel note and show confirmation."""
+    text = message.text.strip() if message.text else ""
+    note = "" if text == "/skip" else text
+    
+    await state.update_data(note=note)
+    data = await state.get_data()
+    
+    # Show confirmation
+    await state.set_state(HotelBooking.confirm)
+    await message.answer(
+        f"📋 <b>Buyurtmani tasdiqlang:</b>\n\n"
+        f"🏨 <b>Mehmonxona:</b> {data['partner_name']}\n"
+        f"📅 <b>Kirish:</b> {data['date_from']}\n"
+        f"📅 <b>Chiqish:</b> {data['date_to']}\n"
+        f"👥 <b>Mehmonlar:</b> {data['guests']}\n"
+        f"🛏 <b>Xona:</b> {data.get('room_type') or '-'}\n"
+        f"📝 <b>Izoh:</b> {note or '-'}",
+        parse_mode="HTML",
+        reply_markup=build_booking_confirm_keyboard("hotel")
+    )
+
+
+@booking_router.callback_query(F.data == "confirm:hotel:yes")
+async def hotel_confirm_yes(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Confirm hotel booking - create in DB and dispatch to partner."""
+    await callback.answer()
+    
+    data = await state.get_data()
+    user = callback.from_user
+    user_id = user.id if user else 0
+    
+    payload = {
+        "date_from": data.get("date_from", ""),
+        "date_to": data.get("date_to", ""),
+        "guests": data.get("guests", ""),
+        "room_type": data.get("room_type", ""),
+        "note": data.get("note", ""),
+    }
+    
+    user_info = {
+        "name": user.full_name if user else "—",
+        "username": f"@{user.username}" if user and user.username else "—",
+        "phone": data.get("phone", "—"),
+    }
+    
+    # Create booking
+    booking_id = await db_pg.create_booking(
+        service_type="hotel",
+        partner_id=data["partner_id"],
+        user_telegram_id=user_id,
+        payload=payload,
+        status="new"
+    )
+    
+    if not booking_id:
+        await callback.message.edit_text(
+            "❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring.",
+            reply_markup=None
+        )
+        await state.clear()
+        return
+    
+    # Dispatch to partner using universal function
+    success, message = await dispatch_booking_to_partner(
+        bot=bot,
+        booking_id=booking_id,
+        partner_id=data["partner_id"],
+        service_type="hotel",
+        payload=payload,
+        user_info=user_info,
+    )
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ <b>Buyurtma yuborildi!</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"🏨 <b>Mehmonxona:</b> {data['partner_name']}\n\n"
+            f"Partner javobini kuting.",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    else:
+        await callback.message.edit_text(
+            f"⚠️ <b>Buyurtma yaratildi</b>\n\n"
+            f"🆔 ID: <code>{booking_id[:8]}...</code>\n"
+            f"🏨 <b>Mehmonxona:</b> {data['partner_name']}\n\n"
+            f"{message}",
+            parse_mode="HTML",
+            reply_markup=None
+        )
+    
+    await state.clear()
+    await callback.message.answer("Bosh menyu:", reply_markup=get_main_menu())
+
+
+@booking_router.callback_query(F.data == "confirm:hotel:no")
+async def hotel_confirm_no(callback: CallbackQuery, state: FSMContext):
+    """Cancel hotel booking."""
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("❌ Buyurtma bekor qilindi.", reply_markup=None)
+    await callback.message.answer("Bosh menyu:", reply_markup=get_main_menu())
+

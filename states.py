@@ -48,3 +48,16 @@ class TaxiBooking(StatesGroup):
     note = State()               # Optional note
     confirm = State()            # Final confirmation
 
+
+class HotelBooking(StatesGroup):
+    """FSM states for hotel booking flow."""
+    
+    selecting_partner = State()  # User selecting a hotel from list
+    date_from = State()          # Check-in date
+    date_to = State()            # Check-out date
+    guests = State()             # Number of guests
+    room_type = State()          # Room preference (optional)
+    note = State()               # Optional note
+    confirm = State()            # Final confirmation
+
+

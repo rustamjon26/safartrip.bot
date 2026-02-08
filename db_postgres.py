@@ -5,7 +5,8 @@ Uses asyncpg with connection pooling for high performance.
 All functions include try/except to handle errors gracefully.
 
 Tables:
-- partners (id, type, display_name, connect_code, telegram_id, is_active, created_at)
+- partners (id, type, display_name, connect_code, telegram_id, is_active, created_at,
+           latitude, longitude, address)
 - bookings (id, service_type, partner_id, user_telegram_id, payload, status, created_at)
 """
 import os
@@ -106,14 +107,15 @@ async def fetch_partners_by_type(partner_type: str) -> list[dict]:
 
 
 async def get_partner_by_id(partner_id: str) -> dict | None:
-    """Get partner by UUID string."""
+    """Get partner by UUID string, including location fields for hotels."""
     if not _pool:
         return None
     
     try:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow("""
-                SELECT id, type, display_name, connect_code, telegram_id, is_active, created_at
+                SELECT id, type, display_name, connect_code, telegram_id, is_active, created_at,
+                       latitude, longitude, address
                 FROM partners
                 WHERE id = $1
             """, UUID(partner_id))
@@ -126,6 +128,9 @@ async def get_partner_by_id(partner_id: str) -> dict | None:
                     "telegram_id": row["telegram_id"],
                     "is_active": row["is_active"],
                     "created_at": row["created_at"],
+                    "latitude": row["latitude"],
+                    "longitude": row["longitude"],
+                    "address": row["address"],
                 }
             return None
     except Exception as e:
@@ -310,3 +315,22 @@ async def get_bookings_by_user(user_telegram_id: int, limit: int = 10) -> list[d
     except Exception as e:
         logger.error(f"Error fetching user bookings: {e}")
         return []
+
+
+async def update_booking_sent(booking_id: str) -> bool:
+    """Mark booking as sent to partner with timestamp."""
+    if not _pool:
+        return False
+    
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE bookings
+                SET status = 'sent_to_partner', sent_at = NOW()
+                WHERE id = $1
+            """, UUID(booking_id))
+            return result == "UPDATE 1"
+    except Exception as e:
+        logger.error(f"Error updating booking sent status: {e}")
+        return False
+
