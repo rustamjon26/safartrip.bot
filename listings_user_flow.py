@@ -245,6 +245,7 @@ HOTEL_SUBTYPES = [
     ("shale", "Shale"),
     ("uy_mehmonxona", "Uy mehmonxona"),
     ("mehmonxona", "Mehmonxona"),
+    ("kapsula", "Kapsula mehmonxona"),
     ("dacha", "Dacha"),
 ]
 

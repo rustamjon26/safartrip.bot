@@ -96,10 +96,11 @@ async def safe_edit(message: Message, text: str, reply_markup=None) -> Optional[
 class AddListing(StatesGroup):
     """Wizard states."""
     category = State()
+    hotel_type = State()  # New step for hotels
     title = State()
     description = State()
     region = State()
-    subtype = State()
+    subtype = State()     # Deprecated for hotel, used for others if needed? No, purely internal now.
     price = State()
     phone = State()
     location = State()
@@ -122,6 +123,7 @@ HOTEL_SUBTYPES = [
     ("shale", "Shale"),
     ("uy_mehmonxona", "Uy mehmonxona"),
     ("mehmonxona", "Mehmonxona"),
+    ("kapsula", "Kapsula mehmonxona"),
     ("dacha", "Dacha"),
 ]
 
@@ -235,13 +237,21 @@ async def step_category(callback: CallbackQuery, state: FSMContext):
     
     category = callback.data.split(":")[2]
     await state.update_data(category=category)
-    await state.set_state(AddListing.title)
     
-    cat_name = dict(CATEGORIES).get(category, category)
-    await safe_edit(
-        callback.message,
-        f"✅ Kategoriya: <b>{h(cat_name)}</b>\n\n📌 Nomini kiriting (min 3 belgi):",
-    )
+    if category == "hotel":
+        await state.set_state(AddListing.hotel_type)
+        await safe_edit(
+            callback.message,
+            "🏨 <b>Mehmonxona turini tanlang</b>",
+            reply_markup=kb_subtypes(),
+        )
+    else:
+        await state.set_state(AddListing.title)
+        cat_name = dict(CATEGORIES).get(category, category)
+        await safe_edit(
+            callback.message,
+            f"✅ Kategoriya: <b>{h(cat_name)}</b>\n\n📌 Nomini kiriting (min 3 belgi):",
+        )
 
 
 # =============================================================================
@@ -264,7 +274,48 @@ async def step_title(message: Message, state: FSMContext):
     await state.update_data(title=text)
     await state.set_state(AddListing.description)
     
-    await safe_send(message, f"✅ Nom: <b>{h(text)}</b>\n\n📝 Ta'rifni kiriting (/skip o'tkazish):")
+    # Get category for example
+    data = await state.get_data()
+    category = data.get("category", "hotel")
+    
+    examples = {
+        "hotel": (
+            "Mish-mish buloq hududida joylashgan shinam dacha.\n"
+            "— 3 ta yotoqxona\n"
+            "— Wi-Fi, TV, Karaoke\n"
+            "— Basseyn va sauna bor\n"
+            "— Oilaviy dam olish uchun qulay"
+        ),
+        "guide": (
+            "Zomin bo'ylab professional gid xizmati.\n"
+            "— Tog'larga sayohat\n"
+            "— Sharsharalar va g'orlar\n"
+            "— Transfer xizmati bor\n"
+            "— Rus va ingliz tillarida"
+        ),
+        "taxi": (
+            "Toshkent - Zomin yo'nalishida qulay taksi.\n"
+            "— Chevrolet Tracker 2\n"
+            "— Konditsioner bor\n"
+            "— 4 kishi sig'adi\n"
+            "— Yukxona katta"
+        ),
+        "place": (
+            "Zomin milliy bog'i hududidagi sharshara.\n"
+            "— Balandligi 15 metr\n"
+            "— Atrofda piknik joylari bor\n"
+            "— Kirish pullik"
+        ),
+    }
+    
+    ex_text = examples.get(category, "...")
+    
+    await safe_send(
+        message, 
+        f"✅ Nom: <b>{h(text)}</b>\n\n"
+        f"📝 <b>Ta'rifni kiriting</b> (/skip o'tkazish):\n\n"
+        f"<i>Namuna:</i>\n{h(ex_text)}"
+    )
 
 
 # =============================================================================
@@ -306,14 +357,8 @@ async def step_region(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     category = data.get("category", "")
     
-    if category == "hotel":
-        await state.set_state(AddListing.subtype)
-        await safe_edit(
-            callback.message,
-            "✅ Hudud: <b>Zomin</b>\n\n🏨 Turini tanlang:",
-            reply_markup=kb_subtypes(),
-        )
-    elif category in PRICE_CATEGORIES:
+    # Subtype already selected in Step 2 for hotels
+    if category in PRICE_CATEGORIES:
         await state.set_state(AddListing.price)
         await safe_edit(
             callback.message,
@@ -328,22 +373,22 @@ async def step_region(callback: CallbackQuery, state: FSMContext):
 
 
 # =============================================================================
-# Step: Subtype (hotel only)
+# Step: Subtype (Hotel Type) - Moved to Step 2
 # =============================================================================
 
 @listing_wizard_router.callback_query(F.data.startswith("wiz:sub:"))
-async def step_subtype(callback: CallbackQuery, state: FSMContext):
-    """Handle subtype selection for hotels."""
+async def step_hotel_type(callback: CallbackQuery, state: FSMContext):
+    """Handle hotel type selection."""
     await callback.answer()
     
     subtype = callback.data.split(":")[2]
     await state.update_data(subtype=subtype)
-    await state.set_state(AddListing.price)
+    await state.set_state(AddListing.title)
     
     subtype_name = dict(HOTEL_SUBTYPES).get(subtype, subtype)
     await safe_edit(
         callback.message,
-        f"✅ Turi: <b>{h(subtype_name)}</b>\n\n💰 Narxni kiriting (UZS) yoki /skip:",
+        f"✅ Turi: <b>{h(subtype_name)}</b>\n\n📌 Nomini kiriting (min 3 belgi):",
     )
 
 
