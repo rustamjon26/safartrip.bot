@@ -3,15 +3,10 @@
 .env.*
 !.env.example
 
-# Session files (Pyrogram/Telethon)
-*.session
-*.session-journal
-
 # Database files
 *.db
 *.sqlite3
 *.sqlite
-backups/
 
 # Python
 __pycache__/

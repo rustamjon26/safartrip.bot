@@ -21,14 +21,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Configuration
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMINS_RAW = os.getenv("ADMINS", "")
-ADMINS = [int(x.strip()) for x in ADMINS_RAW.split(",") if x.strip().isdigit()]
+# Configuration — single source of truth
+from config import BOT_TOKEN, ADMINS
 
-if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN not set!")
-    sys.exit(1)
 
 # Setup logging
 logging.basicConfig(

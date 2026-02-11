@@ -153,6 +153,13 @@ async def ensure_schema() -> bool:
 
     try:
         async with _pool.acquire() as conn:
+            # Ensure pgcrypto extension for gen_random_uuid() on PG < 13
+            try:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            except Exception as e:
+                # Non-fatal: gen_random_uuid() is built-in on PG 13+
+                logger.warning(f"Could not enable pgcrypto (OK on PG 13+): {e}")
+
             # =========================================================
             # 1. LISTINGS TABLE
             # =========================================================

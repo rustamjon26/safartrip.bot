@@ -2,10 +2,7 @@
 aiogram==3.4.1
 python-dotenv==1.0.1
 
-# HTTP client with timeouts (for external API calls)
-aiohttp>=3.9.0
-
-# PostgreSQL async driver (required for partner booking system)
+# PostgreSQL async driver (required for booking system)
 asyncpg>=0.29.0
 
 # Optional: Redis for FSM persistence (recommended for production)

@@ -11,7 +11,7 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 COPY . .
 
 # Security: Remove any accidentally copied sensitive files
-RUN rm -f .env *.session *.session-journal *.db
+RUN rm -f .env *.db
 
 # Run bot
 CMD ["python", "main.py"]
