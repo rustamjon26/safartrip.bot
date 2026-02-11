@@ -161,16 +161,9 @@ async def show_main_menu(message: Message):
         "",
         "Zomin bo'yicha eng yaxshi takliflar shu yerda!",
         "<i>(Boshqa hududlar tez orada qo'shiladi)</i>",
-        "",
-        "📋 <b>Buyruqlar:</b>",
-        "/browse - Listinglarni ko'rish (Sayohatni boshlash)",
-        "/help - Yordam",
     ]
-    if user_id in ADMINS:
-        lines.append("/add - Yangi listing qo'shish")
-        lines.append("/my_listings - Listinglaringizni boshqarish")
     
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main_menu())
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=build_main_menu(user_id))
 
 
 # =============================================================================
@@ -276,12 +269,22 @@ def kb_contact() -> ReplyKeyboardMarkup:
     )
 
 
-def kb_main_menu() -> ReplyKeyboardMarkup:
-    """Main menu keyboard."""
+def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+    """Main menu keyboard (dynamic for admins)."""
+    # Base user buttons
+    rows = [
+        [KeyboardButton(text="🧭 Sayohatni boshlash"), KeyboardButton(text="📍 Hudud")],
+        [KeyboardButton(text="❓ Yordam")]
+    ]
+    
+    # Admin buttons
+    from config import ADMINS
+    if user_id in ADMINS:
+        rows.append([KeyboardButton(text="➕ Listing qo'shish")])
+        rows.append([KeyboardButton(text="🗂 Mening listinglarim")])
+        
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Qidirish"), KeyboardButton(text="📍 Hudud")]
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         one_time_keyboard=False,  # Persistent menu
     )
@@ -358,7 +361,8 @@ def kb_booking_confirm(listing_id: str) -> InlineKeyboardMarkup:
 # =============================================================================
 
 @user_flow_router.message(Command("browse"))
-@user_flow_router.message(F.text == "🔍 Qidirish")
+@user_flow_router.message(F.text == "🧭 Sayohatni boshlash")
+@user_flow_router.message(F.text == "🔍 Qidirish") # Legacy support
 async def cmd_browse(message: Message, state: FSMContext):
     """Start browsing flow."""
     await state.clear()
@@ -377,13 +381,57 @@ async def cmd_browse(message: Message, state: FSMContext):
 
 
 @user_flow_router.message(F.text == "📍 Hudud")
-async def cmd_hudud(message: Message):
+async def cmd_hudud_btn(message: Message):
     """Handle 📍 Hudud button."""
     await safe_send(
         message,
         "🏔 <b>Zomin</b> ✅\n\n"
         "(Boshqa hududlar tez orada qo‘shiladi)"
     )
+
+
+@user_flow_router.message(F.text == "❓ Yordam")
+async def cmd_help_btn(message: Message):
+    """Handle Help button (triggers main help)."""
+    # Since cmd_help is in main.py, we just show a simple help text here 
+    # to avoid circular imports or complex routing.
+    # Or ideally, main.py should handle this if we want exactly the same output.
+    # But user asked to keep it simple.
+    await safe_send(
+        message,
+        "📚 <b>Yordam</b>\n\n"
+        "<b>Compass</b> - Sayohatni boshlash\n"
+        "<b>Hudud</b> - Hozirgi lokatsiya\n"
+        "<i>Adminlar uchun qo'shimcha menyular mavjud.</i>",
+        reply_markup=build_main_menu(message.from_user.id)
+    )
+    
+    
+@user_flow_router.message(F.text == "➕ Listing qo'shish")
+async def cmd_add_btn(message: Message, state: FSMContext):
+    """Trigger listing wizard (Admin only)."""
+    # Check admin
+    from config import ADMINS
+    if message.from_user.id not in ADMINS:
+        return
+        
+    # We need to call the wizard start. 
+    # Since wizard router is separate, but we are all in same dispatcher...
+    # We can't easily call the function across routers without importing.
+    # We will import it inside here to avoid top-level circular dep.
+    from listing_wizard import start_add_listing
+    await start_add_listing(message, state)
+
+
+@user_flow_router.message(F.text == "🗂 Mening listinglarim")
+async def cmd_my_listings_btn(message: Message):
+    """Trigger my listings (Admin only)."""
+    from config import ADMINS
+    if message.from_user.id not in ADMINS:
+        return
+        
+    from listing_wizard import cmd_my_listings
+    await cmd_my_listings(message)
 
 
 @user_flow_router.message(F.text)
@@ -395,7 +443,7 @@ async def handle_unknown_text(message: Message):
     await safe_send(
         message,
         "Buyruqlardan foydalaning: /browse yoki /help",
-        reply_markup=kb_main_menu()
+        reply_markup=build_main_menu(message.from_user.id)
     )
 
 

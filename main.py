@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Import modules
 import db_postgres as db
 from listing_wizard import listing_wizard_router
-from listings_user_flow import user_flow_router, start_registration, kb_main_menu
+from listings_user_flow import user_flow_router, start_registration, build_main_menu
 from booking_dispatch import booking_dispatch_router, start_timeout_checker, stop_timeout_checker
 
 
@@ -114,7 +114,7 @@ async def main():
         if user_id in ADMINS:
             lines.append("/add - Yangi listing qo'shish")
             lines.append("/my_listings - Listinglaringizni boshqarish")
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=build_main_menu(user_id))
     
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
@@ -137,7 +137,7 @@ async def main():
                 "/my_listings - Listinglaringizni boshqarish",
                 "/health - Tizim holati",
             ])
-        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main_menu())
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=build_main_menu(user_id))
     
     @dp.message(Command("health"))
     async def cmd_health(message: Message):
