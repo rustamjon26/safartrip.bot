@@ -170,7 +170,7 @@ async def show_main_menu(message: Message):
         lines.append("/add - Yangi listing qo'shish")
         lines.append("/my_listings - Listinglaringizni boshqarish")
     
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main_menu())
 
 
 # =============================================================================
@@ -276,6 +276,17 @@ def kb_contact() -> ReplyKeyboardMarkup:
     )
 
 
+def kb_main_menu() -> ReplyKeyboardMarkup:
+    """Main menu keyboard."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Qidirish"), KeyboardButton(text="📍 Hudud")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,  # Persistent menu
+    )
+
+
 def kb_categories() -> InlineKeyboardMarkup:
     """Category selection."""
     buttons = [[InlineKeyboardButton(text=name, callback_data=f"uf:cat:{code}")] for code, name in CATEGORIES]
@@ -347,15 +358,44 @@ def kb_booking_confirm(listing_id: str) -> InlineKeyboardMarkup:
 # =============================================================================
 
 @user_flow_router.message(Command("browse"))
+@user_flow_router.message(F.text == "🔍 Qidirish")
 async def cmd_browse(message: Message, state: FSMContext):
     """Start browsing flow."""
     await state.clear()
     await state.set_state(BrowseState.region)
     
+    # Remove older reply keyboard if we want inline only
+    # But usually bots keep main menu or hide it
+    # We will hide main menu temporarily or keep it?
+    # Requirement: keep UX simple.
+    
     await safe_send(
         message,
         "<b>Qaysi hududga bormoqchisiz?</b>",
         reply_markup=kb_regions(),
+    )
+
+
+@user_flow_router.message(F.text == "📍 Hudud")
+async def cmd_hudud(message: Message):
+    """Handle 📍 Hudud button."""
+    await safe_send(
+        message,
+        "🏔 <b>Zomin</b> ✅\n\n"
+        "(Boshqa hududlar tez orada qo‘shiladi)"
+    )
+
+
+@user_flow_router.message(F.text)
+async def handle_unknown_text(message: Message):
+    """Fallback for unknown text messages (in no specific state)."""
+    # Simply ignore or give hint if it looks like a command attempt?
+    # User requirement: Avoid “Update is not handled”.
+    # Provide a hint.
+    await safe_send(
+        message,
+        "Buyruqlardan foydalaning: /browse yoki /help",
+        reply_markup=kb_main_menu()
     )
 
 
