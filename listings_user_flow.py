@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter, BaseFilter
 from aiogram.exceptions import TelegramBadRequest
 
 import db_postgres as db
@@ -37,6 +37,13 @@ user_flow_router = Router(name="user_flow")
 # Registration Flow
 # =============================================================================
 
+class Registration(StatesGroup):
+    """User registration flow."""
+    contact = State()
+    first_name = State()
+    last_name = State()
+
+
 async def start_registration(message: Message, state: FSMContext):
     """Start mandatory registration flow."""
     await state.clear()
@@ -50,7 +57,7 @@ async def start_registration(message: Message, state: FSMContext):
     )
 
 
-@user_flow_router.message(Registration.contact, F.contact)
+@user_flow_router.message(StateFilter(Registration.contact), F.contact)
 async def process_contact(message: Message, state: FSMContext):
     """Handle valid contact sharing."""
     contact = message.contact
@@ -74,7 +81,7 @@ async def process_contact(message: Message, state: FSMContext):
     )
 
 
-@user_flow_router.message(Registration.contact)
+@user_flow_router.message(StateFilter(Registration.contact))
 async def process_contact_fallback(message: Message):
     """Fallback for invalid contact input (e.g. text)."""
     await message.answer(
@@ -83,7 +90,7 @@ async def process_contact_fallback(message: Message):
     )
 
 
-@user_flow_router.message(Registration.first_name)
+@user_flow_router.message(StateFilter(Registration.first_name))
 async def process_first_name(message: Message, state: FSMContext):
     """Handle first name input."""
     name = (message.text or "").strip()
@@ -98,7 +105,7 @@ async def process_first_name(message: Message, state: FSMContext):
     await message.answer(f"👤 Familyangizni kiriting ({h(name)}):")
 
 
-@user_flow_router.message(Registration.last_name)
+@user_flow_router.message(StateFilter(Registration.last_name))
 async def process_last_name(message: Message, state: FSMContext):
     """Handle last name input and save to DB."""
     last_name = (message.text or "").strip()
@@ -217,13 +224,6 @@ class BrowseState(StatesGroup):
     category = State()
     subtype = State()
     listing = State()
-
-
-class Registration(StatesGroup):
-    """User registration flow."""
-    contact = State()
-    first_name = State()
-    last_name = State()
 
 
 class BookingForm(StatesGroup):
