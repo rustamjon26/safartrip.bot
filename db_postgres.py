@@ -134,8 +134,9 @@ async def _create_index_safe(conn, index_name: str, table: str, columns: str, wh
     """Create index if it doesn't exist."""
     if not await _index_exists(conn, index_name):
         where_clause = f" WHERE {where}" if where else ""
+        unique = "UNIQUE " if index_name.endswith("_uq") else ""
         await conn.execute(
-            f"CREATE INDEX {index_name} ON {table}({columns}){where_clause}"
+            f"CREATE {unique}INDEX {index_name} ON {table}({columns}){where_clause}"
         )
         logger.info(f"Created index {index_name}")
 
@@ -265,6 +266,26 @@ async def ensure_schema() -> bool:
             await _create_index_safe(conn, "idx_bookings_listing_status", "bookings", "listing_id, status")
             await _create_index_safe(conn, "idx_bookings_user_created", "bookings", "user_telegram_id, created_at DESC")
             await _create_index_safe(conn, "idx_bookings_expires", "bookings", "expires_at, status", "expires_at IS NOT NULL")
+
+            # =========================================================
+            # 5. USERS TABLE
+            # =========================================================
+            if not await _table_exists(conn, "users"):
+                await conn.execute("""
+                    CREATE TABLE users (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        telegram_id BIGINT UNIQUE NOT NULL,
+                        phone TEXT NOT NULL,
+                        first_name TEXT NOT NULL,
+                        last_name TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                logger.info("Created users table")
+            
+            # Ensure unique index on telegram_id (safe/idempotent)
+            await _create_index_safe(conn, "users_telegram_id_uq", "users", "telegram_id", None)
             
         logger.info("DB schema ensured (listings, bookings) - migration complete")
         return True
@@ -292,6 +313,7 @@ async def reset_schema() -> bool:
         async with _pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS bookings CASCADE")
             await conn.execute("DROP TABLE IF EXISTS listings CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS users CASCADE")
             await conn.execute("DROP TABLE IF EXISTS partners CASCADE")  # Old table
             logger.warning("All tables dropped!")
         
@@ -432,6 +454,60 @@ async def get_listings_stats() -> dict:
     except Exception as e:
         logger.error(f"Error getting listings stats: {e}")
         return {}
+
+
+# =============================================================================
+# Users CRUD
+# =============================================================================
+
+async def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
+    """Get user by Telegram ID."""
+    if not _pool:
+        return None
+    
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, telegram_id, phone, first_name, last_name, created_at
+                FROM users WHERE telegram_id = $1
+                """,
+                int(telegram_id),
+            )
+            if not row:
+                return None
+            return dict(row)
+    except Exception as e:
+        logger.error(f"Error getting user: {e}")
+        return None
+
+
+async def upsert_user(telegram_id: int, phone: str, first_name: str, last_name: str) -> bool:
+    """Insert or update user details."""
+    if not _pool:
+        return False
+    
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (telegram_id, phone, first_name, last_name, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    phone = EXCLUDED.phone,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    updated_at = NOW()
+                """,
+                int(telegram_id),
+                phone,
+                first_name,
+                last_name,
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error upserting user: {e}")
+        return False
 
 
 # =============================================================================

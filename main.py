@@ -20,6 +20,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
 
 # Configuration — single source of truth
 from config import BOT_TOKEN, ADMINS
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Import modules
 import db_postgres as db
 from listing_wizard import listing_wizard_router
-from listings_user_flow import user_flow_router
+from listings_user_flow import user_flow_router, start_registration
 from booking_dispatch import booking_dispatch_router, start_timeout_checker, stop_timeout_checker
 
 
@@ -86,34 +87,55 @@ async def main():
     from aiogram.filters import Command
     
     @dp.message(Command("start"))
-    async def cmd_start(message: Message):
-        """Handle /start command."""
-        await message.answer(
-            "🏔 <b>Safar.uz</b>\n\n"
-            "Zomin sayohatlaringiz uchun eng yaxshi takliflar!\n\n"
-            "📋 <b>Buyruqlar:</b>\n"
-            "/browse - Listinglarni ko'rish\n"
-            "/add - Yangi listing qo'shish (partnyorlar uchun)\n"
-            "/my_listings - Listinglaringizni boshqarish\n"
+    async def cmd_start(message: Message, state: FSMContext):
+        """Handle /start command. Checks registration."""
+        user_id = message.from_user.id
+        
+        # Check if user exists
+        user = await db.get_user_by_telegram_id(user_id)
+        if not user:
+            await start_registration(message, state)
+            return
+
+        lines = [
+            "Assalomu alaykum! <b>Safar.uz</b> botiga xush kelibsiz.",
+            "",
+            "Bu yerda siz mehmonxonalar, dam olish maskanlari va gid xizmatlarini oson topishingiz va band qilishingiz mumkin.",
+            "",
+            "Zomin bo'yicha eng yaxshi takliflar shu yerda!",
+            "<i>(Boshqa hududlar tez orada qo'shiladi)</i>",
+            "",
+            "📋 <b>Buyruqlar:</b>",
+            "/browse - Listinglarni ko'rish (Sayohatni boshlash)",
             "/help - Yordam",
-            parse_mode="HTML",
-        )
+        ]
+        if user_id in ADMINS:
+            lines.append("/add - Yangi listing qo'shish")
+            lines.append("/my_listings - Listinglaringizni boshqarish")
+        await message.answer("\n".join(lines), parse_mode="HTML")
     
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
         """Handle /help command."""
-        await message.answer(
-            "📚 <b>Yordam</b>\n\n"
-            "<b>Foydalanuvchilar uchun:</b>\n"
-            "/browse - Mehmonxonalar, gidlar, taksini ko'rish\n"
-            "Listingni tanlab, bron qilishingiz mumkin\n\n"
-            "<b>Partnyorlar uchun:</b>\n"
-            "/add - Yangi listing qo'shish\n"
-            "/my_listings - Listinglaringizni boshqarish\n\n"
-            "<b>Admin:</b>\n"
-            "/health - Tizim holati",
-            parse_mode="HTML",
-        )
+        user_id = message.from_user.id
+        lines = [
+            "📚 <b>Yordam</b>",
+            "",
+            "<b>Foydalanuvchilar uchun:</b>",
+            "/browse - Mehmonxonalar, gidlar, taksini ko'rish",
+            "Listingni tanlab, bron qilishingiz mumkin.",
+            "",
+            "<i>Safar.uz — Sayohatni oson rejalashtiring.</i>",
+        ]
+        if user_id in ADMINS:
+            lines.extend([
+                "",
+                "<b>Admin uchun:</b>",
+                "/add - Yangi listing qo'shish",
+                "/my_listings - Listinglaringizni boshqarish",
+                "/health - Tizim holati",
+            ])
+        await message.answer("\n".join(lines), parse_mode="HTML")
     
     @dp.message(Command("health"))
     async def cmd_health(message: Message):

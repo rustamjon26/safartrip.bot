@@ -22,7 +22,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, StateFilter, BaseFilter
 from aiogram.exceptions import TelegramBadRequest
 
 from config import ADMINS
@@ -31,6 +31,29 @@ import db_postgres as db
 logger = logging.getLogger(__name__)
 
 listing_wizard_router = Router(name="listing_wizard")
+
+
+# =============================================================================
+# Router-Level Admin Guard
+# =============================================================================
+
+class AdminFilter(BaseFilter):
+    """Block non-admin users from this entire router."""
+    async def __call__(self, event) -> bool:
+        user = getattr(event, "from_user", None)
+        if user and user.id in ADMINS:
+            return True
+        # For commands, send denial; for callbacks/FSM, silently reject
+        if hasattr(event, "answer"):
+            try:
+                await event.answer("⛔ Bu buyruq faqat adminlar uchun.")
+            except Exception:
+                pass
+        return False
+
+
+listing_wizard_router.message.filter(AdminFilter())
+listing_wizard_router.callback_query.filter(AdminFilter())
 
 
 # =============================================================================
@@ -112,22 +135,9 @@ MAX_PHOTOS = 5
 # Permission Check
 # =============================================================================
 
-def is_super_admin(user_id: int) -> bool:
-    """Check if user is super admin."""
+def is_admin(user_id: int) -> bool:
+    """Check if user is in ADMINS list."""
     return user_id in ADMINS
-
-
-async def is_partner_admin(user_id: int) -> bool:
-    """Check if user has created any listings."""
-    listings = await db.fetch_listings_by_admin(user_id)
-    return len(listings) > 0
-
-
-async def can_add_listings(user_id: int) -> bool:
-    """Check if user can add listings."""
-    if is_super_admin(user_id):
-        return True
-    return await is_partner_admin(user_id)
 
 
 # =============================================================================
@@ -200,11 +210,8 @@ def kb_listing_actions(listing_id: str, is_active: bool) -> InlineKeyboardMarkup
 
 @listing_wizard_router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
-    """Start the Add Listing wizard."""
+    """Start the Add Listing wizard. Admin-only (enforced by router filter)."""
     user_id = message.from_user.id
-    
-    # For now, allow all users to become partner admins by adding listings
-    # Super admins are always allowed
     
     await state.clear()
     await state.update_data(admin_id=user_id, photos=[])
@@ -626,7 +633,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @listing_wizard_router.message(Command("my_listings"))
 async def cmd_my_listings(message: Message):
-    """List current user's listings."""
+    """List current user's listings. Admin-only (enforced by router filter)."""
     user_id = message.from_user.id
     listings = await db.fetch_listings_by_admin(user_id)
     

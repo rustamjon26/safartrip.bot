@@ -17,11 +17,30 @@ from aiogram import Router, Bot, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
+from aiogram.filters import BaseFilter
+from config import ADMINS
 import db_postgres as db
 
 logger = logging.getLogger(__name__)
 
 booking_dispatch_router = Router(name="booking_dispatch")
+
+
+# =============================================================================
+# Router-Level Admin Guard
+# =============================================================================
+
+class AdminFilter(BaseFilter):
+    """Block non-admin users from this router."""
+    async def __call__(self, event) -> bool:
+        user = getattr(event, "from_user", None)
+        if user and user.id in ADMINS:
+            return True
+        return False
+
+
+booking_dispatch_router.message.filter(AdminFilter())
+booking_dispatch_router.callback_query.filter(AdminFilter())
 
 # Background task reference
 _timeout_task: Optional[asyncio.Task] = None

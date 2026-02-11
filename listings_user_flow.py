@@ -16,6 +16,7 @@ from aiogram import Router, Bot, F
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     InputMediaPhoto,
 )
 from aiogram.fsm.context import FSMContext
@@ -25,9 +26,142 @@ from aiogram.exceptions import TelegramBadRequest
 
 import db_postgres as db
 
+
+
 logger = logging.getLogger(__name__)
 
 user_flow_router = Router(name="user_flow")
+
+
+# =============================================================================
+# Registration Flow
+# =============================================================================
+
+async def start_registration(message: Message, state: FSMContext):
+    """Start mandatory registration flow."""
+    await state.clear()
+    await state.set_state(Registration.contact)
+    
+    await message.answer(
+        "👋 Assalomu alaykum!\n\n"
+        "Botdan foydalanish uchun ro'yxatdan o'tishingiz kerak.\n"
+        "Iltimos, telefon raqamingizni yuboring (tugmani bosing):",
+        reply_markup=kb_contact(),
+    )
+
+
+@user_flow_router.message(Registration.contact, F.contact)
+async def process_contact(message: Message, state: FSMContext):
+    """Handle valid contact sharing."""
+    contact = message.contact
+    user_id = message.from_user.id
+    
+    # Check if contact belongs to sender
+    if contact.user_id != user_id:
+        await message.answer(
+            "❌ Iltimos, o'z raqamingizni yuboring (kontakt yuborish).",
+            reply_markup=kb_contact(),
+        )
+        return
+
+    await state.update_data(phone=contact.phone_number)
+    await state.set_state(Registration.first_name)
+    
+    await message.answer(
+        "✅ Raqam qabul qilindi.\n\n"
+        "👤 Ismingizni kiriting:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@user_flow_router.message(Registration.contact)
+async def process_contact_fallback(message: Message):
+    """Fallback for invalid contact input (e.g. text)."""
+    await message.answer(
+        "📞 Iltimos, telefon raqamingizni pastdagi tugma orqali yuboring (Kontakt yuborish).",
+        reply_markup=kb_contact(),
+    )
+
+
+@user_flow_router.message(Registration.first_name)
+async def process_first_name(message: Message, state: FSMContext):
+    """Handle first name input."""
+    name = (message.text or "").strip()
+    
+    if not message.text or not name or len(name) < 2:
+        await message.answer("❌ Ism matn bo'lishi va kamida 2 harfdan iborat bo'lishi kerak:")
+        return
+        
+    await state.update_data(first_name=name)
+    await state.set_state(Registration.last_name)
+    
+    await message.answer(f"👤 Familyangizni kiriting ({h(name)}):")
+
+
+@user_flow_router.message(Registration.last_name)
+async def process_last_name(message: Message, state: FSMContext):
+    """Handle last name input and save to DB."""
+    last_name = (message.text or "").strip()
+    
+    if not message.text or not last_name or len(last_name) < 2:
+        await message.answer("❌ Familya matn bo'lishi va kamida 2 harfdan iborat bo'lishi kerak:")
+        return
+        
+    data = await state.get_data()
+    user_id = message.from_user.id
+    phone = data.get("phone")
+    first_name = data.get("first_name")
+    
+    # Save to DB
+    success = await db.upsert_user(user_id, phone, first_name, last_name)
+    
+    if not success:
+        await message.answer("❌ Tizimda xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring (/start).")
+        await state.clear()
+        return
+        
+    await state.clear()
+    
+    # Send success message + normal /start menu
+    await message.answer(
+        f"✅ <b>Ro'yxatdan o'tdingiz!</b>\n\n"
+        f"Xush kelibsiz, {h(first_name)} {h(last_name)}!",
+        parse_mode="HTML"
+    )
+    
+    # Continue normal flow (show menu)
+    # We call the logic that normally serves /start here manually
+    await show_main_menu(message)
+
+
+async def show_main_menu(message: Message):
+    """Show the main menu (used after registration or login)."""
+    # Logic copied from main.py's cmd_start to avoid circular import issues
+    # But since main.py defines it, and we are in listings_user_flow.py,
+    # we can't easily call main.py's function.
+    # So we define the menu logic here or use a shared helper.
+    # Given 'Do not create new file', we duplicate the message structure here.
+    
+    from config import ADMINS
+    user_id = message.from_user.id
+    
+    lines = [
+        "Assalomu alaykum! <b>Safar.uz</b> botiga xush kelibsiz.",
+        "",
+        "Bu yerda siz mehmonxonalar, dam olish maskanlari va gid xizmatlarini oson topishingiz va band qilishingiz mumkin.",
+        "",
+        "Zomin bo'yicha eng yaxshi takliflar shu yerda!",
+        "<i>(Boshqa hududlar tez orada qo'shiladi)</i>",
+        "",
+        "📋 <b>Buyruqlar:</b>",
+        "/browse - Listinglarni ko'rish (Sayohatni boshlash)",
+        "/help - Yordam",
+    ]
+    if user_id in ADMINS:
+        lines.append("/add - Yangi listing qo'shish")
+        lines.append("/my_listings - Listinglaringizni boshqarish")
+    
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 # =============================================================================
@@ -85,6 +219,13 @@ class BrowseState(StatesGroup):
     listing = State()
 
 
+class Registration(StatesGroup):
+    """User registration flow."""
+    contact = State()
+    first_name = State()
+    last_name = State()
+
+
 class BookingForm(StatesGroup):
     """Booking form states."""
     name = State()
@@ -122,6 +263,15 @@ def kb_regions() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏔 Zomin", callback_data="uf:region:zomin")],
     ])
+
+
+def kb_contact() -> ReplyKeyboardMarkup:
+    """Request contact keyboard."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def kb_categories() -> InlineKeyboardMarkup:
@@ -202,7 +352,7 @@ async def cmd_browse(message: Message, state: FSMContext):
     
     await safe_send(
         message,
-        "🗺 <b>Hududni tanlang</b>",
+        "<b>Qaysi hududga bormoqchisiz?</b>",
         reply_markup=kb_regions(),
     )
 
@@ -222,7 +372,7 @@ async def select_region(callback: CallbackQuery, state: FSMContext):
     
     await safe_edit(
         callback.message,
-        f"🗺 Hudud: <b>Zomin</b>\n\n📂 Kategoriyani tanlang:",
+        f"🗺 Hudud: <b>Zomin</b>\n\nBoshqa viloyatlar va shaharlar bosqichma-bosqich qo'shib boriladi.\n\n📂 Kategoriyani tanlang:",
         reply_markup=kb_categories(),
     )
 
@@ -520,7 +670,7 @@ async def back_to_region(callback: CallbackQuery, state: FSMContext):
     
     await safe_edit(
         callback.message,
-        "🗺 <b>Hududni tanlang</b>",
+        "<b>Qaysi hududga bormoqchisiz?</b>",
         reply_markup=kb_regions(),
     )
 
