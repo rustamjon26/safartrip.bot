@@ -98,7 +98,9 @@ async def main():
             return
 
         lines = [
-            "Assalomu alaykum! <b>Safar.uz</b> botiga xush kelibsiz.",
+            "Assalomu alaykum! <b>SafarTrip.uz</b> botiga xush kelibsiz.",
+            "",
+            "📍 <b>Hudud:</b> Zomin",
             "",
             "Bu yerda siz mehmonxonalar, dam olish maskanlari va gid xizmatlarini oson topishingiz va band qilishingiz mumkin.",
             "",
@@ -125,7 +127,7 @@ async def main():
             "/browse - Mehmonxonalar, gidlar, taksini ko'rish",
             "Listingni tanlab, bron qilishingiz mumkin.",
             "",
-            "<i>Safar.uz — Sayohatni oson rejalashtiring.</i>",
+            "<i>SafarTrip.uz — Sayohatni oson rejalashtiring.</i>",
         ]
         if user_id in ADMINS:
             lines.extend([

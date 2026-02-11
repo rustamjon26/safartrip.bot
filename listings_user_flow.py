@@ -153,7 +153,9 @@ async def show_main_menu(message: Message):
     user_id = message.from_user.id
     
     lines = [
-        "Assalomu alaykum! <b>Safar.uz</b> botiga xush kelibsiz.",
+        "Assalomu alaykum! <b>SafarTrip.uz</b> botiga xush kelibsiz.",
+        "",
+        "📍 <b>Hudud:</b> Zomin",
         "",
         "Bu yerda siz mehmonxonalar, dam olish maskanlari va gid xizmatlarini oson topishingiz va band qilishingiz mumkin.",
         "",
