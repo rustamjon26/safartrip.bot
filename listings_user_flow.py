@@ -10,6 +10,7 @@ Features:
 
 import html
 import logging
+import re
 from typing import Optional
 
 from aiogram import Router, Bot, F
@@ -225,7 +226,8 @@ class BookingForm(StatesGroup):
     """Booking form states."""
     guest_count = State()
     extra_guest_names = State()
-    phone = State()
+    phone_choice = State()
+    phone_manual = State()
     date = State()
     note = State()
     confirm = State()
@@ -346,6 +348,17 @@ def kb_detail(listing: dict) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="uf:back:list")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kb_phone_choice() -> ReplyKeyboardMarkup:
+    """Phone choice: use registered or enter new."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Shu raqam"), KeyboardButton(text="✏️ Boshqa raqam")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def kb_booking_confirm(listing_id: str) -> InlineKeyboardMarkup:
@@ -888,12 +901,11 @@ async def booking_guest_count(message: Message, state: FSMContext):
             guest_count=1,
             guest_names=[registered_name],
         )
-        await state.set_state(BookingForm.phone)
         await safe_send(
             message,
-            f"✅ Mehmon: <b>{h(registered_name)}</b> (avtomatik)\n\n"
-            f"📱 Telefon raqamingizni kiriting:",
+            f"✅ Mehmon: <b>{h(registered_name)}</b> (avtomatik)",
         )
+        await _ask_phone_step(message, state)
     else:
         # guest_count >= 2: registered user is Guest #1
         remaining = guest_count - 1
@@ -958,25 +970,137 @@ async def booking_extra_names(message: Message, state: FSMContext):
     guest_names = [registered_name] + names
     
     await state.update_data(guest_names=guest_names)
-    await state.set_state(BookingForm.phone)
     
     names_display = ", ".join(h(n) for n in guest_names)
     await safe_send(
         message,
-        f"✅ Mehmonlar ({guest_count}): <b>{names_display}</b>\n\n"
-        f"📱 Telefon raqamingizni kiriting:",
+        f"✅ Mehmonlar ({guest_count}): <b>{names_display}</b>",
+    )
+    await _ask_phone_step(message, state)
+
+
+# -----------------------------------------------------------------------------
+# Smart Phone Step
+# -----------------------------------------------------------------------------
+
+def _normalize_uz_phone(raw: str) -> str | None:
+    """Normalize Uzbek phone to +998XXXXXXXXX. Returns None if invalid.
+    Accepts: +998 90 123 45 67, (90)1234567, 998-90-123-45-67, 901234567, etc.
+    """
+    digits = re.sub(r"[\s\-\(\)\+]", "", raw)  # strip common separators
+    digits = re.sub(r"\D", "", digits)           # strip any remaining non-digits
+    if digits.startswith("998") and len(digits) == 12:
+        return f"+{digits}"
+    if len(digits) == 9 and digits[0] in "3456789":
+        return f"+998{digits}"
+    return None
+
+
+async def _ask_phone_step(message: Message, state: FSMContext):
+    """Shared helper: offer registered phone or ask for manual input."""
+    user_id = message.from_user.id
+    user = await db.get_user_by_telegram_id(user_id)
+    user_phone = (user.get("phone") or "").strip() if user else ""
+    logger.info(f"ask_phone_step user={user_id} phone={user_phone!r}")
+
+    if user_phone:
+        await state.update_data(registered_phone=user_phone)
+        await state.set_state(BookingForm.phone_choice)
+        await safe_send(
+            message,
+            f"📞 Telefon: <b>{h(user_phone)}</b> (avtomatik)\n"
+            f"Shu raqamdan foydalanamizmi?",
+            reply_markup=kb_phone_choice(),
+        )
+    else:
+        # No registered phone — request contact share
+        await state.set_state(BookingForm.phone_manual)
+        await safe_send(
+            message,
+            "📱 Telefon raqamingiz topilmadi.\n"
+            "Iltimos, kontaktingizni yuboring (tugmani bosing):",
+            reply_markup=kb_contact(),
+        )
+
+
+@user_flow_router.message(BookingForm.phone_choice, F.text == "✅ Shu raqam")
+async def booking_phone_use_registered(message: Message, state: FSMContext):
+    """User chose to use their registered phone."""
+    data = await state.get_data()
+    phone = data.get("registered_phone", "")
+    
+    await state.update_data(booking_phone=phone)
+    await state.set_state(BookingForm.date)
+    
+    await safe_send(
+        message,
+        f"✅ Telefon: <b>{h(phone)}</b>\n\n"
+        f"📅 Sanani kiriting (masalan: '15-fevral' yoki '15-20 fevral'):",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
-@user_flow_router.message(BookingForm.phone)
-async def booking_phone(message: Message, state: FSMContext):
-    """Collect phone."""
-    phone = (message.text or "").strip()
+@user_flow_router.message(BookingForm.phone_choice, F.text == "✏️ Boshqa raqam")
+async def booking_phone_ask_manual(message: Message, state: FSMContext):
+    """User wants to enter a different phone."""
+    await state.set_state(BookingForm.phone_manual)
+    await safe_send(
+        message,
+        "📱 Telefon raqamingizni kiriting (+998901234567):",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@user_flow_router.message(BookingForm.phone_choice)
+async def booking_phone_choice_fallback(message: Message):
+    """Fallback for invalid phone choice input."""
+    await safe_send(
+        message,
+        "❌ Iltimos, quyidagi tugmalardan birini tanlang:\n"
+        "• <b>✅ Shu raqam</b> — ro'yxatdagi raqamni ishlatish\n"
+        "• <b>✏️ Boshqa raqam</b> — yangi raqam kiritish",
+        reply_markup=kb_phone_choice(),
+    )
+
+
+@user_flow_router.message(BookingForm.phone_manual, F.contact)
+async def booking_phone_contact(message: Message, state: FSMContext):
+    """Handle contact sharing in phone_manual state."""
+    contact = message.contact
+    if contact.user_id != message.from_user.id:
+        await safe_send(
+            message,
+            "❌ Iltimos, o'z raqamingizni yuboring.",
+            reply_markup=kb_contact(),
+        )
+        return
+
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = f"+{phone}"
+
+    await state.update_data(booking_phone=phone)
+    await state.set_state(BookingForm.date)
+    await safe_send(
+        message,
+        f"✅ Telefon: <b>{h(phone)}</b>\n\n"
+        f"📅 Sanani kiriting (masalan: '15-fevral' yoki '15-20 fevral'):",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@user_flow_router.message(BookingForm.phone_manual)
+async def booking_phone_manual(message: Message, state: FSMContext):
+    """Collect and validate manually entered phone."""
+    raw = (message.text or "").strip()
     
-    # Basic validation
-    digits = "".join(c for c in phone if c.isdigit())
-    if len(digits) < 7:
-        await safe_send(message, "❌ Telefon raqami kamida 7 raqamdan iborat bo'lishi kerak:")
+    phone = _normalize_uz_phone(raw)
+    if not phone:
+        await safe_send(
+            message,
+            "❌ Noto'g'ri format. Iltimos, O'zbekiston raqamini kiriting:\n"
+            "<i>Masalan: +998901234567 yoki 901234567</i>",
+        )
         return
     
     await state.update_data(booking_phone=phone)
