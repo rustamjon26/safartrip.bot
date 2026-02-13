@@ -120,9 +120,18 @@ async def dispatch_booking_to_admin(bot: Bot, booking_id: str) -> bool:
     if booking.get("price_from"):
         lines.append(f"💰 {booking['price_from']:,} {booking.get('currency', 'UZS')}")
     
+    # Guest info: backward compatible (old bookings have 'name', new have 'guest_names')
+    guest_names = payload.get("guest_names")
+    if guest_names and isinstance(guest_names, list):
+        guest_count = payload.get("guest_count", len(guest_names))
+        names_str = ", ".join(h(n) for n in guest_names)
+        lines.append("")
+        lines.append(f"👥 Mehmonlar ({guest_count}): {names_str}")
+    else:
+        lines.append("")
+        lines.append(f"👤 Ism: {h(payload.get('name', '—'))}")
+    
     lines.extend([
-        "",
-        f"👤 Ism: {h(payload.get('name', '—'))}",
         f"📱 Telefon: {h(payload.get('phone', '—'))}",
         f"📅 Sana: {h(payload.get('date', '—'))}",
     ])

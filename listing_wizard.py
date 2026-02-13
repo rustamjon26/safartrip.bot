@@ -280,31 +280,33 @@ async def step_title(message: Message, state: FSMContext):
     
     examples = {
         "hotel": (
-            "Mish-mish buloq hududida joylashgan shinam dacha.\n"
-            "— 3 ta yotoqxona\n"
-            "— Wi-Fi, TV, Karaoke\n"
-            "— Basseyn va sauna bor\n"
-            "— Oilaviy dam olish uchun qulay"
+            "🏔 Zomin Suffa Mehmonxonasi\n"
+            "📍 Manzil: Zomin, markazga yaqin\n"
+            "🛏 Xona turlari: 2 va 4 kishilik\n"
+            "💰 Narx: 250 000 so‘mdan\n"
+            "🌐 Wi-Fi, 🚿 issiq suv, 🅿️ avtoturargoh mavjud\n"
+            "🍽 Nonushta kiradi"
         ),
         "guide": (
-            "Zomin bo'ylab professional gid xizmati.\n"
-            "— Tog'larga sayohat\n"
-            "— Sharsharalar va g'orlar\n"
-            "— Transfer xizmati bor\n"
-            "— Rus va ingliz tillarida"
+            "🧑‍🏫 Zomin bo‘yicha professional gid\n"
+            "📍 Yo‘nalish: Zomin tog‘lari va tarixiy joylar\n"
+            "🗣 Tillar: O‘zbek, Rus, Ingliz\n"
+            "🕒 3–5 soatlik ekskursiya\n"
+            "💰 Narx: 400 000 so‘m (guruh uchun)"
         ),
         "taxi": (
-            "Toshkent - Zomin yo'nalishida qulay taksi.\n"
-            "— Chevrolet Tracker 2\n"
-            "— Konditsioner bor\n"
-            "— 4 kishi sig'adi\n"
-            "— Yukxona katta"
+            "🚕 Zomin – Toshkent yo‘nalishi\n"
+            "🚘 Mashina: Cobalt / Gentra\n"
+            "👥 4 yo‘lovchi\n"
+            "💰 Narx: 120 000 so‘m (1 kishi)\n"
+            "🕒 Oldindan buyurtma mumkin"
         ),
         "place": (
-            "Zomin milliy bog'i hududidagi sharshara.\n"
-            "— Balandligi 15 metr\n"
-            "— Atrofda piknik joylari bor\n"
-            "— Kirish pullik"
+            "📍 Zomin Milliy bog‘i\n"
+            "🏞 Go‘zal tog‘ manzarasi\n"
+            "📸 Fotosessiya uchun qulay joy\n"
+            "🕒 Tashrif vaqti: 08:00 – 20:00\n"
+            "🎟 Kirish: Bepul"
         ),
     }
     

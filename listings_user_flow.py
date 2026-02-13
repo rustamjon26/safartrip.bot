@@ -223,7 +223,8 @@ class BrowseState(StatesGroup):
 
 class BookingForm(StatesGroup):
     """Booking form states."""
-    name = State()
+    guest_count = State()
+    extra_guest_names = State()
     phone = State()
     date = State()
     note = State()
@@ -845,29 +846,126 @@ async def start_booking(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.update_data(booking_listing_id=full_id, booking_listing=listing)
-    await state.set_state(BookingForm.name)
+    await state.set_state(BookingForm.guest_count)
     
     await safe_edit(
         callback.message,
         f"📝 <b>Bron qilish</b>\n\n"
         f"📌 {h(listing['title'])}\n\n"
-        f"👤 Ism-familyangizni kiriting:",
+        f"👥 Necha kishi bo'lasiz? (1-10)\n"
+        f"<i>1 kishi bo'lsa, ismingiz avtomatik qo'shiladi.</i>",
     )
 
 
-@user_flow_router.message(BookingForm.name)
-async def booking_name(message: Message, state: FSMContext):
-    """Collect name."""
-    name = (message.text or "").strip()
+@user_flow_router.message(BookingForm.guest_count)
+async def booking_guest_count(message: Message, state: FSMContext):
+    """Collect guest count, auto-fill registered user name."""
+    text = (message.text or "").strip()
     
-    if not name or len(name) < 2:
-        await safe_send(message, "❌ Ism kamida 2 belgidan iborat bo'lishi kerak:")
+    # Validate integer 1-10
+    if not text.isdigit() or not (1 <= int(text) <= 10):
+        await safe_send(message, "❌ Iltimos, 1 dan 10 gacha son kiriting:")
         return
     
-    await state.update_data(booking_name=name)
+    guest_count = int(text)
+    
+    # Fetch registered user from DB
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    if not user or not user.get("first_name"):
+        await safe_send(
+            message,
+            "❌ Siz hali ro'yxatdan o'tmagansiz.\n"
+            "Iltimos, /start buyrug'ini bosing va ro'yxatdan o'ting.",
+        )
+        await state.clear()
+        return
+    
+    registered_name = f"{user['first_name']} {user['last_name']}".strip()
+    
+    if guest_count == 1:
+        # Auto-fill: only the registered user
+        await state.update_data(
+            guest_count=1,
+            guest_names=[registered_name],
+        )
+        await state.set_state(BookingForm.phone)
+        await safe_send(
+            message,
+            f"✅ Mehmon: <b>{h(registered_name)}</b> (avtomatik)\n\n"
+            f"📱 Telefon raqamingizni kiriting:",
+        )
+    else:
+        # guest_count >= 2: registered user is Guest #1
+        remaining = guest_count - 1
+        await state.update_data(
+            guest_count=guest_count,
+            registered_name=registered_name,
+        )
+        await state.set_state(BookingForm.extra_guest_names)
+        await safe_send(
+            message,
+            f"✅ Siz (mehmon №1): <b>{h(registered_name)}</b>\n\n"
+            f"✍️ Qolgan <b>{remaining}</b> kishining ism-familiyasini kiriting "
+            f"(har birini yangi qatordan):\n\n"
+            f"<i>Misol:\nAhmad Karimov\nDilshod Umarov</i>",
+        )
+
+
+@user_flow_router.message(BookingForm.extra_guest_names)
+async def booking_extra_names(message: Message, state: FSMContext):
+    """Collect additional guest names (one per line), validate each."""
+    raw = (message.text or "").strip()
+    
+    if not raw:
+        await safe_send(message, "❌ Iltimos, ismlarni kiriting (har birini yangi qatordan):")
+        return
+    
+    data = await state.get_data()
+    guest_count = data.get("guest_count", 2)
+    registered_name = data.get("registered_name", "")
+    needed = guest_count - 1
+    
+    # Parse lines, strip blanks
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    
+    if len(lines) < needed:
+        await safe_send(
+            message,
+            f"❌ {needed} ta ism kerak, siz {len(lines)} ta yozdingiz.\n"
+            f"Iltimos, har birini yangi qatordan kiriting:",
+        )
+        return
+    
+    # Take first 'needed' lines
+    names = lines[:needed]
+    
+    # Validate each name: 3-60 chars
+    invalid = []
+    for i, nm in enumerate(names, start=1):
+        if len(nm) < 3 or len(nm) > 60:
+            invalid.append(f"  #{i}: \"{nm}\" ({len(nm)} belgi)")
+    
+    if invalid:
+        await safe_send(
+            message,
+            f"❌ Har bir ism 3-60 belgi orasida bo'lishi kerak:\n"
+            + "\n".join(invalid)
+            + "\n\nIltimos, qaytadan kiriting:",
+        )
+        return
+    
+    # Build full guest list: registered user first
+    guest_names = [registered_name] + names
+    
+    await state.update_data(guest_names=guest_names)
     await state.set_state(BookingForm.phone)
     
-    await safe_send(message, f"✅ Ism: <b>{h(name)}</b>\n\n📱 Telefon raqamingizni kiriting:")
+    names_display = ", ".join(h(n) for n in guest_names)
+    await safe_send(
+        message,
+        f"✅ Mehmonlar ({guest_count}): <b>{names_display}</b>\n\n"
+        f"📱 Telefon raqamingizni kiriting:",
+    )
 
 
 @user_flow_router.message(BookingForm.phone)
@@ -922,6 +1020,10 @@ async def booking_note(message: Message, state: FSMContext):
     data = await state.get_data()
     listing = data.get("booking_listing", {})
     
+    guest_count = data.get("guest_count", 1)
+    guest_names = data.get("guest_names", [])
+    names_display = ", ".join(h(n) for n in guest_names) if guest_names else "—"
+    
     lines = [
         "📋 <b>Bronni tasdiqlang</b>",
         "",
@@ -933,7 +1035,7 @@ async def booking_note(message: Message, state: FSMContext):
     
     lines.extend([
         "",
-        f"👤 Ism: {h(data.get('booking_name', ''))}",
+        f"👥 Mehmonlar ({guest_count}): {names_display}",
         f"📱 Telefon: {h(data.get('booking_phone', ''))}",
         f"📅 Sana: {h(data.get('booking_date', ''))}",
     ])
@@ -963,8 +1065,11 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot: Bot):
         return
     
     # Create booking
+    guest_names = data.get("guest_names", [])
     payload = {
-        "name": data.get("booking_name", ""),
+        "guest_count": data.get("guest_count", 1),
+        "guest_names": guest_names,
+        "name": ", ".join(guest_names),  # backward compat
         "phone": data.get("booking_phone", ""),
         "date": data.get("booking_date", ""),
         "note": data.get("booking_note"),
