@@ -436,9 +436,9 @@ async def cmd_my_listings_btn(message: Message):
     await cmd_my_listings(message)
 
 
-@user_flow_router.message(F.text)
+@user_flow_router.message(StateFilter(None), F.text)
 async def handle_unknown_text(message: Message):
-    """Fallback for unknown text messages (in no specific state)."""
+    """Fallback for unknown text messages (ONLY when no FSM state is active)."""
     # Simply ignore or give hint if it looks like a command attempt?
     # User requirement: Avoid “Update is not handled”.
     # Provide a hint.
