@@ -96,11 +96,12 @@ async def safe_edit(message: Message, text: str, reply_markup=None) -> Optional[
 class AddListing(StatesGroup):
     """Wizard states."""
     category = State()
-    hotel_type = State()  # New step for hotels
+    hotel_type = State()  # For hotels
+    owner = State()       # Owner Telegram ID
     title = State()
     description = State()
     region = State()
-    subtype = State()     # Deprecated for hotel, used for others if needed? No, purely internal now.
+    subtype = State()
     price = State()
     phone = State()
     location = State()
@@ -178,6 +179,14 @@ def kb_confirm() -> InlineKeyboardMarkup:
     ])
 
 
+def kb_owner_choice() -> InlineKeyboardMarkup:
+    """Owner selection keyboard."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ O'zimga", callback_data="wiz:owner:me")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="wiz:cancel")],
+    ])
+
+
 def kb_my_listings(listings: list[dict]) -> Optional[InlineKeyboardMarkup]:
     """Keyboard for /my_listings."""
     if not listings:
@@ -246,11 +255,14 @@ async def step_category(callback: CallbackQuery, state: FSMContext):
             reply_markup=kb_subtypes(),
         )
     else:
-        await state.set_state(AddListing.title)
+        await state.set_state(AddListing.owner)
         cat_name = dict(CATEGORIES).get(category, category)
         await safe_edit(
             callback.message,
-            f"✅ Kategoriya: <b>{h(cat_name)}</b>\n\n📌 Nomini kiriting (min 3 belgi):",
+            f"✅ Kategoriya: <b>{h(cat_name)}</b>\n\n"
+            f"👤 Partner Telegram ID kiriting (raqam):\n"
+            f"Yoki tugmani bosing:",
+            reply_markup=kb_owner_choice(),
         )
 
 
@@ -385,13 +397,57 @@ async def step_hotel_type(callback: CallbackQuery, state: FSMContext):
     
     subtype = callback.data.split(":")[2]
     await state.update_data(subtype=subtype)
-    await state.set_state(AddListing.title)
-    
+    await state.set_state(AddListing.owner)
+
     subtype_name = dict(HOTEL_SUBTYPES).get(subtype, subtype)
     await safe_edit(
         callback.message,
-        f"✅ Turi: <b>{h(subtype_name)}</b>\n\n📌 Nomini kiriting (min 3 belgi):",
+        f"✅ Turi: <b>{h(subtype_name)}</b>\n\n"
+        f"👤 Partner Telegram ID kiriting (raqam):\n"
+        f"Yoki tugmani bosing:",
+        reply_markup=kb_owner_choice(),
     )
+
+
+# =============================================================================
+# Step: Owner (Partner Telegram ID)
+# =============================================================================
+
+@listing_wizard_router.callback_query(F.data == "wiz:owner:me")
+async def step_owner_me(callback: CallbackQuery, state: FSMContext):
+    """Set owner_user_id to current admin."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    await state.update_data(owner_user_id=user_id)
+    await state.set_state(AddListing.title)
+    await safe_edit(
+        callback.message,
+        f"✅ Partner: <b>{user_id}</b> (siz)\n\n📌 Nomini kiriting (min 3 belgi):",
+    )
+
+
+@listing_wizard_router.message(AddListing.owner)
+async def step_owner_text(message: Message, state: FSMContext):
+    """Handle manually entered partner Telegram ID."""
+    text = (message.text or "").strip()
+
+    if text.lower() == "/cancel":
+        await cancel_wizard(message, state)
+        return
+
+    # Validate numeric
+    if not text.isdigit():
+        await safe_send(message, "❌ Faqat raqam kiriting (Telegram ID):")
+        return
+
+    tid = int(text)
+    if tid < 1:
+        await safe_send(message, "❌ Telegram ID musbat son bo'lishi kerak:")
+        return
+
+    await state.update_data(owner_user_id=tid)
+    await state.set_state(AddListing.title)
+    await safe_send(message, f"✅ Partner: <b>{tid}</b>\n\n📌 Nomini kiriting (min 3 belgi):")
 
 
 # =============================================================================
@@ -604,7 +660,10 @@ async def move_to_confirm(message: Message, state: FSMContext):
     
     photos = data.get("photos", [])
     lines.append(f"📷 Rasmlar: <b>{len(photos)} ta</b>")
-    
+
+    owner_id = data.get("owner_user_id", data.get("admin_id", 0))
+    lines.append(f"👤 Partner: <b>{owner_id}</b>")
+
     lines.extend(["", "👇 Saqlaysizmi?"])
     
     await safe_send(message, "\n".join(lines), reply_markup=kb_confirm())
@@ -631,6 +690,7 @@ async def step_save(callback: CallbackQuery, state: FSMContext):
         "currency": "UZS",
         "phone": data.get("phone"),
         "telegram_admin_id": data.get("admin_id"),
+        "owner_user_id": data.get("owner_user_id", data.get("admin_id")),
         "latitude": data.get("latitude"),
         "longitude": data.get("longitude"),
         "photos": data.get("photos", []),

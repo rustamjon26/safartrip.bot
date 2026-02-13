@@ -1190,6 +1190,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot: Bot):
     
     # Create booking
     guest_names = data.get("guest_names", [])
+    owner_user_id = listing.get("owner_user_id") or listing.get("telegram_admin_id", 0)
     payload = {
         "guest_count": data.get("guest_count", 1),
         "guest_names": guest_names,
@@ -1204,6 +1205,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot: Bot):
         user_telegram_id=callback.from_user.id,
         payload=payload,
         expires_minutes=5,
+        owner_user_id=owner_user_id,
     )
     
     if not booking_id:
@@ -1211,9 +1213,10 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await state.clear()
         return
     
-    # Dispatch to partner admin
-    from booking_dispatch import dispatch_booking_to_admin
-    success = await dispatch_booking_to_admin(bot, booking_id)
+    # Dispatch to owner (partner) + admins
+    from booking_dispatch import dispatch_booking_to_owner, dispatch_booking_to_admins
+    success = await dispatch_booking_to_owner(bot, booking_id)
+    await dispatch_booking_to_admins(bot, booking_id)
     
     if success:
         await safe_edit(
@@ -1226,7 +1229,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot: Bot):
     else:
         await safe_edit(
             callback.message,
-            "⚠️ <b>Bron saqlandi</b>, lekin adminni topmadik.\n\n"
+            "⚠️ <b>Bron saqlandi</b>, lekin partnerni topmadik.\n\n"
             "Tez orada siz bilan bog'lanamiz.",
         )
     

@@ -286,8 +286,41 @@ async def ensure_schema() -> bool:
             
             # Ensure unique index on telegram_id (safe/idempotent)
             await _create_index_safe(conn, "users_telegram_id_uq", "users", "telegram_id", None)
-            
-        logger.info("DB schema ensured (listings, bookings) - migration complete")
+
+            # =========================================================
+            # 6. OWNER_USER_ID on listings (partner routing)
+            # =========================================================
+            await _add_column_if_not_exists(conn, "listings", "owner_user_id", "BIGINT")
+            # Backfill: existing rows get owner_user_id = telegram_admin_id
+            await conn.execute("""
+                UPDATE listings SET owner_user_id = telegram_admin_id
+                WHERE owner_user_id IS NULL AND telegram_admin_id != 0
+            """)
+
+            # =========================================================
+            # 7. PARTNER_MESSAGE_ID on bookings
+            # =========================================================
+            await _add_column_if_not_exists(conn, "bookings", "owner_user_id", "BIGINT")
+            await _add_column_if_not_exists(conn, "bookings", "partner_message_id", "BIGINT")
+            await _add_column_if_not_exists(conn, "bookings", "dispatched_at", "TIMESTAMPTZ")
+
+            # =========================================================
+            # 8. INDEXES for dispatch/timeout performance
+            # =========================================================
+            await _create_index_safe(
+                conn, "bookings_status_expires_idx", "bookings",
+                "status, expires_at", None,
+            )
+            await _create_index_safe(
+                conn, "bookings_owner_idx", "bookings",
+                "owner_user_id", None,
+            )
+            await _create_index_safe(
+                conn, "listings_owner_idx", "listings",
+                "owner_user_id", None,
+            )
+
+        logger.info("DB schema ensured (listings, bookings, users) - migration complete")
         return True
         
     except Exception as e:
@@ -531,9 +564,10 @@ async def create_listing(data: dict[str, Any]) -> Optional[str]:
                 INSERT INTO listings(
                     region, category, subtype, title, description,
                     price_from, currency, phone, telegram_admin_id,
-                    latitude, longitude, address, photos, is_active
+                    latitude, longitude, address, photos, is_active,
+                    owner_user_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, true)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, true, $14)
                 RETURNING id
                 """,
                 data.get("region", "zomin").lower(),
@@ -549,6 +583,7 @@ async def create_listing(data: dict[str, Any]) -> Optional[str]:
                 data.get("longitude"),
                 data.get("address"),
                 json.dumps(data.get("photos", [])),
+                int(data.get("owner_user_id") or data.get("telegram_admin_id", 0)),
             )
             logger.info(f"Created listing {listing_id}")
             return str(listing_id) if listing_id else None
@@ -725,6 +760,7 @@ def _row_to_listing(row) -> dict:
         "currency": row.get("currency", "UZS"),
         "phone": row.get("phone"),
         "telegram_admin_id": row.get("telegram_admin_id", 0),
+        "owner_user_id": row.get("owner_user_id") or row.get("telegram_admin_id", 0),
         "latitude": row.get("latitude"),
         "longitude": row.get("longitude"),
         "address": row.get("address"),
@@ -743,6 +779,7 @@ async def create_booking(
     user_telegram_id: int,
     payload: dict,
     expires_minutes: int = 5,
+    **kwargs,
 ) -> Optional[str]:
     """
     Create a new booking with expiration.
@@ -758,20 +795,24 @@ async def create_booking(
     except:
         return None
 
+    owner_user_id = kwargs.get("owner_user_id", 0)
+
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
         
         async with _pool.acquire() as conn:
             booking_id = await conn.fetchval(
                 """
-                INSERT INTO bookings(listing_id, user_telegram_id, payload, status, expires_at)
-                VALUES ($1, $2, $3::jsonb, 'new', $4)
+                INSERT INTO bookings(listing_id, user_telegram_id, payload,
+                                    status, expires_at, owner_user_id)
+                VALUES ($1, $2, $3::jsonb, 'pending_partner', $4, $5)
                 RETURNING id
                 """,
                 lid,
                 int(user_telegram_id),
                 json.dumps(payload),
                 expires_at,
+                int(owner_user_id) if owner_user_id else None,
             )
             logger.info(f"Created booking {booking_id}")
             return str(booking_id) if booking_id else None
@@ -796,6 +837,7 @@ async def get_booking(booking_id: str) -> Optional[dict]:
                 """
                 SELECT b.id, b.listing_id, b.user_telegram_id, b.payload,
                        b.status, b.expires_at, b.created_at,
+                       b.owner_user_id, b.partner_message_id,
                        l.title as listing_title, l.category, l.telegram_admin_id,
                        l.price_from, l.currency
                 FROM bookings b
@@ -835,6 +877,65 @@ async def update_booking_status(booking_id: str, status: str) -> bool:
         return False
 
 
+async def accept_booking_atomic(booking_id: str, owner_user_id: int) -> bool:
+    """
+    Atomically accept a booking.
+    Only succeeds if status is pending_partner/sent AND owner matches.
+    Prevents race conditions from double-click or concurrent accept+reject.
+    """
+    if not _pool:
+        return False
+    try:
+        bid = UUID(booking_id)
+    except Exception:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE bookings SET status = 'accepted'
+                WHERE id = $1
+                  AND status IN ('pending_partner', 'sent')
+                  AND owner_user_id = $2
+                """,
+                bid,
+                int(owner_user_id),
+            )
+            return res == "UPDATE 1"
+    except Exception as e:
+        logger.exception(f"Error accepting booking atomically: {e}")
+        return False
+
+
+async def reject_booking_atomic(booking_id: str, owner_user_id: int) -> bool:
+    """
+    Atomically reject a booking.
+    Only succeeds if status is pending_partner/sent AND owner matches.
+    """
+    if not _pool:
+        return False
+    try:
+        bid = UUID(booking_id)
+    except Exception:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE bookings SET status = 'rejected'
+                WHERE id = $1
+                  AND status IN ('pending_partner', 'sent')
+                  AND owner_user_id = $2
+                """,
+                bid,
+                int(owner_user_id),
+            )
+            return res == "UPDATE 1"
+    except Exception as e:
+        logger.exception(f"Error rejecting booking atomically: {e}")
+        return False
+
+
 async def fetch_expired_bookings() -> list[dict]:
     """
     Atomically fetch and mark expired bookings as timeout.
@@ -850,20 +951,32 @@ async def fetch_expired_bookings() -> list[dict]:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                UPDATE bookings b
-                SET status = 'timeout'
-                FROM listings l
-                WHERE b.listing_id = l.id
-                  AND b.status IN ('new', 'sent')
-                  AND b.expires_at < NOW()
-                RETURNING b.id, b.user_telegram_id, l.title as listing_title
+                WITH expired AS (
+                    UPDATE bookings
+                    SET status = 'timeout'
+                    WHERE status IN ('pending_partner', 'sent')
+                      AND COALESCE(dispatched_at, created_at) + interval '5 minutes' < NOW()
+                    RETURNING id, user_telegram_id, owner_user_id, listing_id
+                )
+                SELECT e.id, e.user_telegram_id, e.owner_user_id,
+                       l.title as listing_title,
+                       u.phone as owner_phone,
+                       u.first_name as owner_first_name,
+                       u.last_name as owner_last_name
+                FROM expired e
+                LEFT JOIN listings l ON e.listing_id = l.id
+                LEFT JOIN users u ON e.owner_user_id = u.telegram_id
                 """
             )
             return [
                 {
                     "id": str(r["id"]),
                     "user_telegram_id": r["user_telegram_id"],
+                    "owner_user_id": r.get("owner_user_id", 0),
                     "listing_title": r.get("listing_title", "Unknown"),
+                    "owner_phone": r.get("owner_phone"),
+                    "owner_first_name": r.get("owner_first_name"),
+                    "owner_last_name": r.get("owner_last_name"),
                 }
                 for r in rows
             ]
@@ -885,6 +998,8 @@ def _row_to_booking(row) -> dict:
         "id": str(row["id"]),
         "listing_id": str(row["listing_id"]) if row.get("listing_id") else None,
         "user_telegram_id": row.get("user_telegram_id", 0),
+        "owner_user_id": row.get("owner_user_id", 0),
+        "partner_message_id": row.get("partner_message_id"),
         "payload": dict(payload) if payload else {},
         "status": row.get("status", "new"),
         "expires_at": row.get("expires_at"),
@@ -895,6 +1010,62 @@ def _row_to_booking(row) -> dict:
         "price_from": row.get("price_from"),
         "currency": row.get("currency"),
     }
+
+
+async def save_partner_message_id(booking_id: str, message_id: int) -> bool:
+    """Store the Telegram message_id sent to the partner.
+    Idempotent: only sets when currently NULL to avoid overwriting on retry.
+    """
+    if not _pool:
+        return False
+    try:
+        bid = UUID(booking_id)
+    except Exception:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                """UPDATE bookings SET partner_message_id = $1
+                   WHERE id = $2 AND partner_message_id IS NULL""",
+                message_id,
+                bid,
+            )
+            return res == "UPDATE 1"
+    except Exception as e:
+        logger.error(f"Error saving partner_message_id: {e}")
+        return False
+
+
+async def mark_booking_dispatched(booking_id: str, partner_msg_id: int) -> bool:
+    """
+    Atomically mark a booking as dispatched to owner.
+    Sets status='sent', dispatched_at=NOW(), and partner_message_id in one UPDATE.
+    Idempotent: only updates if status is still pending_partner.
+    """
+    if not _pool:
+        return False
+    try:
+        bid = UUID(booking_id)
+    except Exception:
+        return False
+    try:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE bookings
+                SET status = 'sent',
+                    dispatched_at = NOW(),
+                    partner_message_id = COALESCE(partner_message_id, $1)
+                WHERE id = $2
+                  AND status = 'pending_partner'
+                """,
+                partner_msg_id,
+                bid,
+            )
+            return res == "UPDATE 1"
+    except Exception as e:
+        logger.error(f"Error marking booking dispatched: {e}")
+        return False
 
 
 # =============================================================================

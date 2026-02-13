@@ -190,10 +190,6 @@ async def main():
         
         await stop_timeout_checker()
         
-        timeout_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await timeout_task
-        
         await db.close_pool()
         await bot.session.close()
 
